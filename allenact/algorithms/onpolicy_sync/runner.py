@@ -93,7 +93,8 @@ class OnPolicyRunner(object):
         disable_tensorboard: bool = False,
         disable_config_saving: bool = False,
         distributed_ip_and_port: str = "127.0.0.1:0",
-        distributed_preemption_threshold: float = 0.7,
+        # 1.0 disables preemption (used inside run_pipeline in engine.py )
+        distributed_preemption_threshold: float = 1.0,
         machine_id: int = 0,
         save_dir_fmt: SaveDirFormat = SaveDirFormat.FLAT,
         callbacks_paths: Optional[str] = None,
@@ -572,7 +573,7 @@ class OnPolicyRunner(object):
                     initial_model_state_dict if model_hash is None else model_hash
                 ),
                 first_local_worker_id=worker_ids[0],
-                distributed_preemption_threshold=self.distributed_preemption_threshold,
+                distributed_preemption_threshold=1.0,  # NOTE: harcode for now
                 valid_on_initial_weights=valid_on_initial_weights,
                 try_restart_after_task_error=try_restart_after_task_error,
                 save_ckpt_at_every_host=save_ckpt_at_every_host,

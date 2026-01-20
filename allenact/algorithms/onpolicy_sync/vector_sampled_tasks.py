@@ -29,7 +29,7 @@ import numpy as np
 from gym.spaces.dict import Dict as SpaceDict
 from setproctitle import setproctitle as ptitle
 
-from allenact.base_abstractions.misc import RLStepResult
+from allenact.base_abstractions.misc import RLStepResult, SafeRLStepResult
 from allenact.base_abstractions.sensor import SensorSuite, Sensor
 from allenact.base_abstractions.task import TaskSampler
 from allenact.utils.misc_utils import partition_sequence
@@ -448,8 +448,14 @@ class VectorSampledTasks:
                 k += len(current_sampler_fn_args_list)
 
             if self.should_log:
+                sampler_fn_args_preview = []
+                for args in current_sampler_fn_args_list:
+                    args = dict(args)
+                    args["house_inds (showing first 10)"] = args["house_inds"][:10]
+                    args.pop("house_inds")
+                    sampler_fn_args_preview.append(args)
                 get_logger().info(
-                    f"Starting {id}-th VectorSampledTask worker with args {current_sampler_fn_args_list}"
+                    f"Starting {id}-th VectorSampledTask worker with args {sampler_fn_args_preview}"
                 )
 
             ps = self._mp_ctx.Process(  # type: ignore
@@ -894,6 +900,9 @@ class SingleProcessVectorSampledTasks(object):
         ), "number of processes to be created should be greater than 0"
 
         self._num_task_samplers = len(sampler_fn_args_list)
+        get_logger().info(
+            f"Starting SingleProcessVectorSampledTasks with {self._num_task_samplers} task samplers."
+        )
         self._auto_resample_when_done = auto_resample_when_done
 
         self.should_log = should_log
@@ -978,8 +987,22 @@ class SingleProcessVectorSampledTasks(object):
 
             while command != CLOSE_COMMAND:
                 if command == STEP_COMMAND:
+                    if current_task.is_done() and not auto_resample_when_done:
+                        step_result = SafeRLStepResult(
+                            observation=current_task.get_observations(),
+                            reward=0.0,
+                            cost=0.0,
+                            done=True,
+                            info=None,
+                        )
+                        command, data = yield step_result
+                        continue
+
                     step_result: RLStepResult = current_task.step(data)
                     if current_task.is_done():
+                        get_logger().debug(
+                            f"Task in SingleProcessVectorSampledTasks worker {worker_id} completed."
+                        )
                         metrics = current_task.metrics()
                         if metrics is not None and len(metrics) != 0:
                             if step_result.info is None:
@@ -1103,8 +1126,11 @@ class SingleProcessVectorSampledTasks(object):
         generators = []
         for id, current_sampler_fn_args in enumerate(sampler_fn_args):
             if self.should_log:
+                args = dict(current_sampler_fn_args)
+                args["house_inds (showing first 10)"] = args["house_inds"][:10]
+                args.pop("house_inds")
                 get_logger().info(
-                    f"Starting {id}-th SingleProcessVectorSampledTasks generator with args {current_sampler_fn_args}."
+                    f"Starting {id}-th SingleProcessVectorSampledTasks generator with args {args}."
                 )
             generators.append(
                 self._task_sampling_loop_generator_fn(

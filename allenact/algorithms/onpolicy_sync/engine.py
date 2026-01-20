@@ -1,6 +1,7 @@
 """Defines the reinforcement learning `OnPolicyRLEngine`."""
 
 import datetime
+import copy
 import logging
 import numbers
 import os
@@ -9,7 +10,7 @@ import time
 import traceback
 from functools import partial
 from multiprocessing.context import BaseContext
-from typing import Any, Dict, List, Optional, Sequence, Union, cast
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, cast
 
 import filelock
 import torch
@@ -179,6 +180,9 @@ class OnPolicyRLEngine(object):
             or max_sampler_processes_per_worker >= 1
         ), "`max_sampler_processes_per_worker` must be either `None` or a positive integer."
         self.max_sampler_processes_per_worker = max_sampler_processes_per_worker
+        get_logger().info(f"Worker ID: {self.worker_id} | "
+                          f"Num Workers: {self.num_workers} | "
+                          f"Max sampler processes per worker: {self.max_sampler_processes_per_worker}\n")
 
         machine_params = config.machine_params(self.mode)
         self.machine_params: MachineParams
@@ -196,6 +200,8 @@ class OnPolicyRLEngine(object):
 
         self.sensor_preprocessor_graph = None
         self.actor_critic: Optional[ActorCriticModel] = None
+        # self._use_reference_policy = False  # NOTE: not implemented
+        self._use_grpo = False
 
         create_model_kwargs = {}
         if self.machine_params.sensor_preprocessor_graph is not None:
@@ -239,6 +245,17 @@ class OnPolicyRLEngine(object):
             get_logger().debug(
                 f"[{self.mode} worker {self.worker_id}] model weights hash: {model_hash}"
             )
+
+        self._use_grpo = getattr(self.config.params, "use_grpo", False)
+        if self._use_grpo:
+            get_logger().info("Using GRPO !!")
+            grpo_beta = self.config.params.grpo_beta
+            # if grpo_beta > 0:
+            #     self._use_reference_policy = True
+            #     self.ref_actor_critic = copy.deepcopy(self.actor_critic)
+            #     self.ref_actor_critic.eval()
+            #     for p in self.ref_actor_critic.parameters():
+            #         p.requires_grad_(False)
 
         self.is_distributed = False
         self.store: Optional[torch.distributed.TCPStore] = None  # type:ignore
@@ -332,6 +349,7 @@ class OnPolicyRLEngine(object):
                 make_sampler_fn=self.config.make_sampler_fn,
                 sampler_fn_args=self.get_sampler_fn_args(seeds),
                 callback_sensors=self.callback_sensors,
+                auto_resample_when_done=not self._use_grpo,
                 multiprocessing_start_method=(
                     "forkserver" if self.mp_ctx is None else None
                 ),
@@ -654,13 +672,14 @@ class OnPolicyRLEngine(object):
                     # noinspection PyAttributeOutsideInit
                     self._probe_steps = -self._probe_steps
 
-    def  collect_step_across_all_task_samplers(
+    def collect_step_across_all_task_samplers(
         self,
         rollout_storage_uuid: str,
         uuid_to_storage: Dict[str, ExperienceStorage],
         visualizer=None,
         dist_wrapper_class=None,
-    ) -> int:
+        return_dones: bool = False,
+    ) ->  Union[int, Tuple[int, List[int]]]:
         rollout_storage = cast(RolloutStorage, uuid_to_storage[rollout_storage_uuid])
         actions, actor_critic_output, memory, _ = self.act(
             rollout_storage=rollout_storage,
@@ -791,6 +810,9 @@ class OnPolicyRLEngine(object):
             else:
                 visualizer.collect(actor_critic=actor_critic_output)
 
+        if return_dones:
+            return 0, dones
+
         return npaused
 
     def distributed_weighted_sum(
@@ -867,7 +889,7 @@ class OnPolicyRLEngine(object):
 
         costs_mean = costs_summed_over_steps.mean()
 
-        self._lagrange.update_lagrange_multiplier(costs_mean)
+        self._lagrange.update_lagrange_multiplier(costs_mean) # TODO: add flag
         # self._lagrange.update_lagrange_multiplier(self.training_pipeline.current_stage_storage[self.training_pipeline.rollout_storage_uuid].costs.mean())
         # print(costs_mean)
         training_settings = stage_component.training_settings
@@ -1743,9 +1765,9 @@ class OnPolicyTrainer(OnPolicyRLEngine):
                     step += 1
 
                     try:
-                        num_paused = self.collect_step_across_all_task_samplers(
+                        num_paused, sampler_dones = self.collect_step_across_all_task_samplers(
                             rollout_storage_uuid=self.training_pipeline.rollout_storage_uuid,
-                            uuid_to_storage=uuid_to_storage,
+                            uuid_to_storage=uuid_to_storage, return_dones=True
                         )
                     except (TimeoutError, EOFError) as e:
                         if (
@@ -1788,6 +1810,15 @@ class OnPolicyTrainer(OnPolicyRLEngine):
                     # `collect_step_across_all_task_samplers` if `num_paused != 0` here but this serves
                     # as a sanity check.
                     assert num_paused == 0
+                    
+                    if len(sampler_dones) == sum(sampler_dones):
+                        # All samplers are done
+                        get_logger().info(
+                            f"[{self.mode} worker {self.worker_id}] All samplers are done after"
+                            f" {step} steps (out of {cur_stage_training_settings.num_steps})"
+                            f" with {num_done} workers done"
+                        )
+                        break
 
                     if self.is_distributed:
                         # Preempt stragglers
@@ -1819,6 +1850,13 @@ class OnPolicyTrainer(OnPolicyRLEngine):
                 if self.is_distributed:
                     # Mark that a worker is done collecting experience
                     self.num_workers_done.add("done", 1)
+                    
+                    get_logger().debug(
+                        f"[{self.mode} worker {self.worker_id}] Finished rollout with"
+                        f" {self.step_count - self.former_steps} steps."
+                        f" Rollout count: {self.training_pipeline.rollout_count}"
+                    )
+                    
                     self.num_workers_steps.add(
                         "steps", self.step_count - self.former_steps
                     )
@@ -1842,7 +1880,7 @@ class OnPolicyTrainer(OnPolicyRLEngine):
                         int(self.num_workers_steps.get("steps")) + self.former_steps
                     )
 
-                before_update_info = dict(
+                before_update_info = dict(  # TODO: do we need to add the action log probs here?
                     next_value=actor_critic_output.values.detach(),
                     next_c_value=actor_critic_output.c_values.detach(),
                     use_gae=cur_stage_training_settings.use_gae,
@@ -1926,7 +1964,7 @@ class OnPolicyTrainer(OnPolicyRLEngine):
                 self.training_pipeline.rollout_count
                 % cur_stage_training_settings.advance_scene_rollout_period
                 == 0
-            ):
+            ) or self._use_grpo:
                 get_logger().info(
                     f"[{self.mode} worker {self.worker_id}] Force advance"
                     f" tasks with {self.training_pipeline.rollout_count} rollouts"
