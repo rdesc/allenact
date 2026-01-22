@@ -248,14 +248,7 @@ class OnPolicyRLEngine(object):
 
         self._use_grpo = getattr(self.config.params, "use_grpo", False)
         if self._use_grpo:
-            get_logger().info("Using GRPO !!")
-            grpo_beta = self.config.params.grpo_beta
-            # if grpo_beta > 0:
-            #     self._use_reference_policy = True
-            #     self.ref_actor_critic = copy.deepcopy(self.actor_critic)
-            #     self.ref_actor_critic.eval()
-            #     for p in self.ref_actor_critic.parameters():
-            #         p.requires_grad_(False)
+            get_logger().info("Using GRPO")
 
         self.is_distributed = False
         self.store: Optional[torch.distributed.TCPStore] = None  # type:ignore
@@ -1439,6 +1432,9 @@ class OnPolicyTrainer(OnPolicyRLEngine):
                 _LRScheduler, self.lr_scheduler
             ).state_dict()
 
+        get_logger().info(
+            f"[{self.mode} worker {self.worker_id}] Saving checkpoint to {model_path}"
+            )
         torch.save(save_dict, model_path)
 
         return model_path
@@ -1768,7 +1764,7 @@ class OnPolicyTrainer(OnPolicyRLEngine):
                         num_paused, sampler_dones = self.collect_step_across_all_task_samplers(
                             rollout_storage_uuid=self.training_pipeline.rollout_storage_uuid,
                             uuid_to_storage=uuid_to_storage, return_dones=True
-                        )
+                        ) # TODO: we should return the number of steps for each of the samplers here no?
                     except (TimeoutError, EOFError) as e:
                         if (
                             not self.try_restart_after_task_error
@@ -1853,7 +1849,7 @@ class OnPolicyTrainer(OnPolicyRLEngine):
                     
                     get_logger().debug(
                         f"[{self.mode} worker {self.worker_id}] Finished rollout with"
-                        f" {self.step_count - self.former_steps} steps."
+                        f" {self.step_count - self.former_steps} steps."  # FIXME
                         f" Rollout count: {self.training_pipeline.rollout_count}"
                     )
                     
@@ -1862,6 +1858,9 @@ class OnPolicyTrainer(OnPolicyRLEngine):
                     )
 
                     # Ensure all workers are done before updating step counter
+                    get_logger().debug("[{} worker {}] Waiting for all workers to finish rollouts.".format(
+                        self.mode, self.worker_id
+                    ))
                     dist.barrier(
                         device_ids=(
                             None

@@ -182,10 +182,34 @@ def _set_log_formatter():
         ch.addFilter(cast(logging.Filter, _AllenActMessageFilter(os.getcwd())))
         _LOGGER.addHandler(ch)
 
+        log_file = os.environ.get("ALLENACT_LOG_FILE")
+        if log_file:
+            add_log_file_handler(log_file)
+
         sys.excepthook = _excepthook
         sys.stdout = cast(io.TextIOWrapper, _StreamToLogger())
 
     return _LOGGER
+
+
+def add_log_file_handler(log_file: str) -> None:
+    if _LOGGER is None:
+        return
+
+    log_file = os.path.abspath(log_file)
+    for handler in _LOGGER.handlers:
+        if isinstance(handler, logging.FileHandler):
+            if os.path.abspath(handler.baseFilename) == log_file:
+                return
+
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    formatter = logging.Formatter(
+        fmt="%(asctime)s %(levelname)s: %(message)s\t[%(filename)s: %(lineno)d]",
+        datefmt="%m/%d %H:%M:%S",
+    )
+    fh = logging.FileHandler(log_file)
+    fh.setFormatter(formatter)
+    _LOGGER.addHandler(fh)
 
 
 class _StreamToLogger:

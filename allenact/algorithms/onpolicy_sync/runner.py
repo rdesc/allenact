@@ -53,7 +53,7 @@ from allenact.utils.misc_utils import (
     get_git_diff_of_project,
 )
 from allenact.utils.model_utils import md5_hash_of_state_dict
-from allenact.utils.system import find_free_port, get_logger
+from allenact.utils.system import add_log_file_handler, find_free_port, get_logger
 from allenact.utils.tensor_utils import SummaryWriter
 from allenact.utils.viz_utils import VizSuite
 
@@ -474,6 +474,7 @@ class OnPolicyRunner(object):
         }
 
         self._local_start_time_str = self._acquire_unique_local_start_time_string()
+        self._setup_log_file()
 
     def get_port(self):
         passed_port = int(self.distributed_ip_and_port.split(":")[1])
@@ -822,6 +823,29 @@ class OnPolicyRunner(object):
         if create_if_none:
             os.makedirs(folder, exist_ok=True)
         return folder
+
+    def log_file_path(self) -> str:
+        path_parts = [
+            (
+                self.config.tag()
+                if self.extra_tag == ""
+                else os.path.join(self.config.tag(), self.extra_tag)
+            ),
+            self.local_start_time_str,
+        ]
+        if self.save_dir_fmt == SaveDirFormat.NESTED:
+            base_dir = os.path.join(self.output_dir, *path_parts, "logs")
+        elif self.save_dir_fmt == SaveDirFormat.FLAT:
+            base_dir = os.path.join(self.output_dir, "logs", *path_parts)
+        else:
+            raise NotImplementedError
+        return os.path.join(base_dir, f"{self.mode}.log")
+
+    def _setup_log_file(self) -> None:
+        log_file = self.log_file_path()
+        os.environ["ALLENACT_LOG_FILE"] = log_file
+        add_log_file_handler(log_file)
+        get_logger().info(f"Logging to {log_file}")
 
     def log_writer_path(self, start_time_str: str) -> str:
         if self.save_dir_fmt == SaveDirFormat.NESTED:

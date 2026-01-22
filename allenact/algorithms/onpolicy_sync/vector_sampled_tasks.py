@@ -452,6 +452,7 @@ class VectorSampledTasks:
                 for args in current_sampler_fn_args_list:
                     args = dict(args)
                     args["house_inds (showing first 10)"] = args["house_inds"][:10]
+                    args["house_inds_count"] = len(args["house_inds"])
                     args.pop("house_inds")
                     sampler_fn_args_preview.append(args)
                 get_logger().info(
@@ -970,10 +971,17 @@ class SingleProcessVectorSampledTasks(object):
         should_log: bool,
     ) -> Generator:
         """Generator for working with Tasks/TaskSampler."""
-
+        
         task_sampler = make_sampler_fn(**sampler_fn_args)
         current_task = task_sampler.next_task()
-
+        get_logger().debug(
+            f"Sampled new task in SingleProcessVectorSampledTasks on device {sampler_fn_args['device']}."
+            f" house index: {current_task.task_info['house_index']}"
+            f" start position: { {k: round(v, 2) for k, v in current_task.task_info['agent_starting_position'].items()} }"
+            f" rotation: {round(current_task.task_info['agent_y_rotation'], 2)}"
+            f" natural language spec: '{current_task.task_info['natural_language_spec']}'"
+        )
+        
         if current_task is None:
             raise RuntimeError(
                 "Newly created task sampler had `None` as it's first task. This likely means that"
@@ -984,6 +992,7 @@ class SingleProcessVectorSampledTasks(object):
 
         try:
             command, data = yield "started"
+            num_steps = 0
 
             while command != CLOSE_COMMAND:
                 if command == STEP_COMMAND:
@@ -999,9 +1008,10 @@ class SingleProcessVectorSampledTasks(object):
                         continue
 
                     step_result: RLStepResult = current_task.step(data)
+                    num_steps += 1
                     if current_task.is_done():
                         get_logger().debug(
-                            f"Task in SingleProcessVectorSampledTasks worker {worker_id} completed."
+                            f"Task in SingleProcessVectorSampledTasks on device {sampler_fn_args['device']} completed after {num_steps} steps."
                         )
                         metrics = current_task.metrics()
                         if metrics is not None and len(metrics) != 0:
@@ -1021,6 +1031,7 @@ class SingleProcessVectorSampledTasks(object):
 
                         if auto_resample_when_done:
                             current_task = task_sampler.next_task()
+                            num_steps = 0
                             if current_task is None:
                                 step_result = step_result.clone({"observation": None})
                             else:
@@ -1035,8 +1046,15 @@ class SingleProcessVectorSampledTasks(object):
                         current_task = task_sampler.next_task(**data)
                     else:
                         current_task = task_sampler.next_task()
+                    num_steps = 0
                     observations = current_task.get_observations()
-
+                    get_logger().debug(
+                        f"Sampled new task in SingleProcessVectorSampledTasks on device {sampler_fn_args['device']}."
+                        f" house index: {current_task.task_info['house_index']}"
+                        f" start position: { {k: round(v, 2) for k, v in current_task.task_info['agent_starting_position'].items()} }"
+                        f" rotation: {round(current_task.task_info['agent_y_rotation'], 2)}"
+                        f" natural language spec: '{current_task.task_info['natural_language_spec']}'"
+                    )
                     command, data = yield observations
 
                 elif command == RENDER_COMMAND:
@@ -1081,6 +1099,7 @@ class SingleProcessVectorSampledTasks(object):
                 elif command == RESET_COMMAND:
                     task_sampler.reset()
                     current_task = task_sampler.next_task()
+                    num_steps = 0
 
                     if current_task is None:
                         raise RuntimeError(
@@ -1128,9 +1147,10 @@ class SingleProcessVectorSampledTasks(object):
             if self.should_log:
                 args = dict(current_sampler_fn_args)
                 args["house_inds (showing first 10)"] = args["house_inds"][:10]
+                args["house_inds_count"] = len(args["house_inds"])
                 args.pop("house_inds")
                 get_logger().info(
-                    f"Starting {id}-th SingleProcessVectorSampledTasks generator with args {args}."
+                    f"Starting {id}-th SingleProcessVectorSampledTasks generator with args {args} for device {current_sampler_fn_args['device']}."
                 )
             generators.append(
                 self._task_sampling_loop_generator_fn(
