@@ -160,6 +160,7 @@ class RolloutBlockStorage(RolloutStorage, MiniBatchStorageMixin):
         self._rewards_full: Optional[torch.Tensor] = None
         self._costs_full: Optional[torch.Tensor] = None
         self._action_log_probs_full: Optional[torch.Tensor] = None
+        self._ref_action_log_probs_full: Optional[torch.Tensor] = None  # NOTE: not implemented
 
         self.step = 0
         self._total_steps = 0
@@ -582,6 +583,7 @@ class RolloutBlockStorage(RolloutStorage, MiniBatchStorageMixin):
             tau=tau,
         )
 
+        # TODO: this probably needs to be updated (unless return is in fact already advantage and value_preds are 0)
         self._advantages = self.returns[:-1] - self.value_preds[:-1]
         self._c_advantages = self.c_returns[:-1] - self.c_value_preds[:-1]
 

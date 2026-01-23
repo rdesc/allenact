@@ -48,6 +48,7 @@ from allenact.algorithms.onpolicy_sync.storage import (
 from allenact.algorithms.onpolicy_sync.vector_sampled_tasks import (
     COMPLETE_TASK_CALLBACK_KEY,
     COMPLETE_TASK_METRICS_KEY,
+    SAMPLER_COMMAND,
     SingleProcessVectorSampledTasks,
     VectorSampledTasks,
 )
@@ -197,6 +198,7 @@ class OnPolicyRLEngine(object):
         self._vector_tasks: Optional[
             Union[VectorSampledTasks, SingleProcessVectorSampledTasks]
         ] = None
+        self._sampler_states_to_restore: Optional[List[Any]] = None
 
         self.sensor_preprocessor_graph = None
         self.actor_critic: Optional[ActorCriticModel] = None
@@ -350,6 +352,9 @@ class OnPolicyRLEngine(object):
                 max_processes=self.max_sampler_processes_per_worker,
                 read_timeout=DEBUG_VST_TIMEOUT if DEBUGGING else 1 * 60,
             )
+            if self._sampler_states_to_restore is not None:
+                self._apply_sampler_states(self._sampler_states_to_restore)
+                self._sampler_states_to_restore = None
         return self._vector_tasks
 
     @staticmethod
@@ -396,7 +401,7 @@ class OnPolicyRLEngine(object):
                 -1 if sd.index is None else sd.index for sd in sampler_devices
             ]
 
-        return [
+        sampler_args = [
             fn(
                 process_ind=process_offset + it,
                 total_processes=total_processes,
@@ -405,6 +410,73 @@ class OnPolicyRLEngine(object):
             )
             for it in range(self.num_samplers)
         ]
+        if self._sampler_states_to_restore is not None:
+            if len(self._sampler_states_to_restore) == len(sampler_args):
+                for args, state in zip(sampler_args, self._sampler_states_to_restore):
+                    args["task_spec_sampler_state"] = state
+                self._sampler_states_to_restore = None
+            else:
+                get_logger().warning(
+                    f"[{self.mode} worker {self.worker_id}] "
+                    "Sampler state count does not match sampler args; "
+                    "skipping sampler state restore."
+                )
+                self._sampler_states_to_restore = None
+        return sampler_args
+
+    def _sampler_state_path_for_checkpoint(self, checkpoint_path: str) -> str:
+        checkpoint_dir = os.path.dirname(os.path.abspath(checkpoint_path))
+        return os.path.join(
+            checkpoint_dir, f"sampler_state_worker_{self.worker_id}.pt"
+        )
+
+    def _apply_sampler_states(self, sampler_states: List[Any]) -> None:
+        if self._vector_tasks is None or len(sampler_states) == 0:
+            return
+        if len(sampler_states) != self.vector_tasks.num_unpaused_tasks:
+            get_logger().warning(
+                f"[{self.mode} worker {self.worker_id}] "
+                "Sampler state count does not match number of samplers; "
+                "skipping sampler state restore."
+            )
+            return
+        data_list = [("load_state_dict", [state]) for state in sampler_states]
+        self.vector_tasks.command(commands=SAMPLER_COMMAND, data_list=data_list)
+
+    def _save_sampler_states(self, checkpoint_path: str) -> None:
+        if self._vector_tasks is None:
+            return
+        try:
+            data_list = [("state_dict", None)] * self.vector_tasks.num_unpaused_tasks
+            sampler_states = self.vector_tasks.command(
+                commands=SAMPLER_COMMAND, data_list=data_list
+            )
+        except Exception:
+            get_logger().warning(
+                f"[{self.mode} worker {self.worker_id}] "
+                "Failed to collect sampler state for checkpoint."
+            )
+            return
+
+        state_path = self._sampler_state_path_for_checkpoint(checkpoint_path)
+        torch.save({"sampler_states": sampler_states}, state_path)
+
+    def _load_sampler_states(self, checkpoint_path: str) -> None:
+        state_path = self._sampler_state_path_for_checkpoint(checkpoint_path)
+        if not os.path.isfile(state_path):
+            return
+        state_payload = torch.load(state_path, map_location="cpu")
+        get_logger().debug(
+            f"[{self.mode} worker {self.worker_id}] "
+            "Loaded sampler states from checkpoint."
+        )
+        sampler_states = state_payload.get("sampler_states")
+        if sampler_states is None:
+            return
+        if self._vector_tasks is not None:
+            self._apply_sampler_states(sampler_states)
+        else:
+            self._sampler_states_to_restore = sampler_states
 
     def checkpoint_load(
         self, ckpt: Union[str, Dict[str, Any]], restart_pipeline: bool
@@ -1404,20 +1476,20 @@ class OnPolicyTrainer(OnPolicyRLEngine):
 
         return logging_pkg
 
-    def checkpoint_save(self, pipeline_stage_index: Optional[int] = None) -> str:
+    def _checkpoint_path(self, pipeline_stage_index: Optional[int] = None) -> str:
         model_name = "exp_{}__stage_{:02d}__steps_{:012d}.pt".format(
-                self.experiment_name,
-                (
-                    self.training_pipeline.current_stage_index
-                    if pipeline_stage_index is None
-                    else pipeline_stage_index
-                ),
-                self.training_pipeline.total_steps,
-            )
-        model_path = os.path.join(
-            self.checkpoints_dir,
-            model_name,
+            self.experiment_name,
+            (
+                self.training_pipeline.current_stage_index
+                if pipeline_stage_index is None
+                else pipeline_stage_index
+            ),
+            self.training_pipeline.total_steps,
         )
+        return os.path.join(self.checkpoints_dir, model_name)
+
+    def checkpoint_save(self, pipeline_stage_index: Optional[int] = None) -> str:
+        model_path = self._checkpoint_path(pipeline_stage_index=pipeline_stage_index)
 
         save_dict = {
             "model_state_dict": self.actor_critic.state_dict(),  # type:ignore
@@ -1442,6 +1514,7 @@ class OnPolicyTrainer(OnPolicyRLEngine):
     def checkpoint_load(
         self, ckpt: Union[str, Dict[str, Any]], restart_pipeline: bool = False
     ) -> Dict[str, Union[Dict[str, Any], torch.Tensor, float, int, str, List]]:
+        checkpoint_path = ckpt if isinstance(ckpt, str) else None
         if restart_pipeline:
             if "training_pipeline_state_dict" in ckpt:
                 del ckpt["training_pipeline_state_dict"]
@@ -1455,6 +1528,9 @@ class OnPolicyTrainer(OnPolicyRLEngine):
             self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])  # type: ignore
             if self.lr_scheduler is not None and "scheduler_state" in ckpt:
                 self.lr_scheduler.load_state_dict(ckpt["scheduler_state"])  # type: ignore
+
+        if checkpoint_path is not None:
+            self._load_sampler_states(checkpoint_path)
 
         self.deterministic_seeds()
 
@@ -1598,6 +1674,7 @@ class OnPolicyTrainer(OnPolicyRLEngine):
         self, pipeline_stage_index: Optional[int] = None
     ):
         model_path = None
+        checkpoint_path = self._checkpoint_path(pipeline_stage_index=pipeline_stage_index)
         self.deterministic_seeds()
         if (
             self.save_ckpt_at_every_host
@@ -1606,6 +1683,7 @@ class OnPolicyTrainer(OnPolicyRLEngine):
             model_path = self.checkpoint_save(pipeline_stage_index=pipeline_stage_index)
             if self.checkpoints_queue is not None:
                 self.checkpoints_queue.put(("eval", model_path))
+        self._save_sampler_states(checkpoint_path)
         self.last_save = self.training_pipeline.total_steps
         return model_path
 
@@ -1849,7 +1927,7 @@ class OnPolicyTrainer(OnPolicyRLEngine):
                     
                     get_logger().debug(
                         f"[{self.mode} worker {self.worker_id}] Finished rollout with"
-                        f" {self.step_count - self.former_steps} steps."  # FIXME
+                        f" {self.step_count - self.former_steps} steps on device {self.device.index}."  # FIXME
                         f" Rollout count: {self.training_pipeline.rollout_count}"
                     )
                     
@@ -1868,7 +1946,10 @@ class OnPolicyTrainer(OnPolicyRLEngine):
                             else [self.device.index]
                         )
                     )
-
+                    get_logger().debug("[{} worker {}] Finished waiting for all workers to finish rollouts.".format(
+                        self.mode, self.worker_id
+                    ))
+                    
                     ndone = int(self.num_workers_done.get("done"))
                     assert (
                         ndone == self.num_workers
@@ -1895,6 +1976,9 @@ class OnPolicyTrainer(OnPolicyRLEngine):
             for sc in self.training_pipeline.current_stage.stage_components:
                 component_storage = uuid_to_storage[sc.storage_uuid]
 
+                get_logger().debug("[{} worker {}] Computing losses...".format(
+                    self.mode, self.worker_id
+                ))
                 self.compute_losses_track_them_and_backprop(
                     stage=self.training_pipeline.current_stage,
                     stage_component=sc,

@@ -220,22 +220,36 @@ class VectorSampledTasks:
 
         self._connection_read_fns = [
             self._create_read_function_with_timeout(
-                read_fn=read_fn, poll_fn=poll_fn, timeout=self.read_timeout
+                read_fn=read_fn,
+                poll_fn=poll_fn,
+                timeout=self.read_timeout,
+                label=f"index={i}",
             )
-            for read_fn, poll_fn in zip(connection_read_fns, connection_poll_fns)
+            for i, (read_fn, poll_fn) in enumerate(
+                zip(connection_read_fns, connection_poll_fns)
+            )
         ]
 
         self._is_closed = False
 
-        for write_fn in self._connection_write_fns:
+        for i, write_fn in enumerate(self._connection_write_fns):
+            get_logger().debug(
+                "Requesting observation space from VectorSampledTask worker %s.", i
+            )
             write_fn((OBSERVATION_SPACE_COMMAND, None))
 
         # Note that we increase the read timeout below as initialization can take some time
-        observation_spaces = [
-            space
-            for read_fn in self._connection_read_fns
-            for space in read_fn(timeout_to_use=5 * self.read_timeout if self.read_timeout is not None else None)  # type: ignore
-        ]
+        observation_spaces: List[Any] = []
+        for i, read_fn in enumerate(self._connection_read_fns):
+            get_logger().debug(
+                "Waiting for observation space from VectorSampledTask worker %s.", i
+            )
+            for space in read_fn(
+                timeout_to_use=5 * self.read_timeout
+                if self.read_timeout is not None
+                else None
+            ):  # type: ignore
+                observation_spaces.append(space)
 
         if any(os is None for os in observation_spaces):
             raise NotImplementedError(
@@ -252,11 +266,18 @@ class VectorSampledTasks:
             )
 
         self.observation_space = observation_spaces[0]
-        for write_fn in self._connection_write_fns:
+        for i, write_fn in enumerate(self._connection_write_fns):
+            get_logger().debug(
+                "Requesting action space from VectorSampledTask worker %s.", i
+            )
             write_fn((ACTION_SPACE_COMMAND, None))
-        self.action_spaces = [
-            space for read_fn in self._connection_read_fns for space in read_fn()
-        ]
+        self.action_spaces: List[Any] = []
+        for i, read_fn in enumerate(self._connection_read_fns):
+            get_logger().debug(
+                "Waiting for action space from VectorSampledTask worker %s.", i
+            )
+            for space in read_fn():
+                self.action_spaces.append(space)
 
     @staticmethod
     def _create_read_function_with_timeout(
@@ -264,13 +285,16 @@ class VectorSampledTasks:
         read_fn: Callable[[], Any],
         poll_fn: Callable[[float], bool],
         timeout: Optional[float],
+        label: Optional[str] = None,
     ) -> Callable[[], Any]:
         def read_with_timeout(timeout_to_use: Optional[float] = timeout):
             if timeout_to_use is not None:
                 # noinspection PyArgumentList
-                if not poll_fn(timeout=timeout_to_use):
+                if not poll_fn(timeout=timeout_to_use): # FIXME timeout occuring here!
+                    label_msg = f" ({label})" if label else ""
                     raise TimeoutError(
-                        f"Did not receive output from `VectorSampledTask` worker for {timeout_to_use} seconds."
+                        "Did not receive output from `VectorSampledTask` worker"
+                        f"{label_msg} for {timeout_to_use} seconds."
                     )
 
             return read_fn()
@@ -452,6 +476,7 @@ class VectorSampledTasks:
                 for args in current_sampler_fn_args_list:
                     args = dict(args)
                     args["house_inds (showing first 10)"] = args["house_inds"][:10]
+                    assert len(args["house_inds"]) > 0, "Empty house_inds provided!"
                     args["house_inds_count"] = len(args["house_inds"])
                     args.pop("house_inds")
                     sampler_fn_args_preview.append(args)
@@ -479,7 +504,7 @@ class VectorSampledTasks:
             ps.start()
             worker_conn.close()  # Means this pipe will close when the child process closes it
             time.sleep(
-                0.1
+                1.0
             )  # Useful to ensure things don't lock up when spawning many envs
         return (
             [p.poll for p in parent_connections],
@@ -972,8 +997,12 @@ class SingleProcessVectorSampledTasks(object):
     ) -> Generator:
         """Generator for working with Tasks/TaskSampler."""
         
+        get_logger().debug("Worker %s creating task sampler.", worker_id)
         task_sampler = make_sampler_fn(**sampler_fn_args)
+        get_logger().debug("Worker %s requesting initial task.", worker_id)
         current_task = task_sampler.next_task()
+        get_logger().debug("Worker %s received initial task.", worker_id)
+
         get_logger().debug(
             f"Sampled new task in SingleProcessVectorSampledTasks on device {sampler_fn_args['device']}."
             f" house index: {current_task.task_info['house_index']}"
@@ -991,8 +1020,10 @@ class SingleProcessVectorSampledTasks(object):
             )
 
         try:
+            get_logger().debug("Worker %s generator started.", worker_id)
             command, data = yield "started"
             num_steps = 0
+            num_global = 0
 
             while command != CLOSE_COMMAND:
                 if command == STEP_COMMAND:
@@ -1007,8 +1038,17 @@ class SingleProcessVectorSampledTasks(object):
                         command, data = yield step_result
                         continue
 
+                    if step_trace_every > 0 and (num_steps % step_trace_every) == 0:
+                        get_logger().debug(
+                            "Worker %s step start %s (device %s, house %s).",
+                            worker_id,
+                            num_steps + 1,
+                            sampler_fn_args.get("device"),
+                            current_task.task_info.get("house_index"),
+                        )
                     step_result: RLStepResult = current_task.step(data)
                     num_steps += 1
+                    num_global += 1
                     if current_task.is_done():
                         get_logger().debug(
                             f"Task in SingleProcessVectorSampledTasks on device {sampler_fn_args['device']} completed after {num_steps} steps."
@@ -1031,10 +1071,21 @@ class SingleProcessVectorSampledTasks(object):
 
                         if auto_resample_when_done:
                             current_task = task_sampler.next_task()
+                            get_logger().debug(
+                                f"Auto-resampling new task in SingleProcessVectorSampledTasks on device {sampler_fn_args['device']}."
+                                f" house index: {current_task.task_info['house_index']}"
+                                f" start position: { {k: round(v, 2) for k, v in current_task.task_info['agent_starting_position'].items()} }"
+                                f" rotation: {round(current_task.task_info['agent_y_rotation'], 2)}"
+                                f" natural language spec: '{current_task.task_info['natural_language_spec']}'"
+                            )
                             num_steps = 0
                             if current_task is None:
                                 step_result = step_result.clone({"observation": None})
                             else:
+                                get_logger().debug(
+                                    "Worker %s getting observations after auto-resample.",
+                                    worker_id,
+                                )
                                 step_result = step_result.clone(
                                     {"observation": current_task.get_observations()}
                                 )
@@ -1042,11 +1093,16 @@ class SingleProcessVectorSampledTasks(object):
                     command, data = yield step_result
 
                 elif command == NEXT_TASK_COMMAND:
+                    get_logger().debug("Worker %s requesting next task.", worker_id)
                     if data is not None:
                         current_task = task_sampler.next_task(**data)
                     else:
                         current_task = task_sampler.next_task()
                     num_steps = 0
+                    num_global = 0
+                    get_logger().debug(
+                        "Worker %s getting observations after next task.", worker_id
+                    )
                     observations = current_task.get_observations()
                     get_logger().debug(
                         f"Sampled new task in SingleProcessVectorSampledTasks on device {sampler_fn_args['device']}."
@@ -1064,7 +1120,17 @@ class SingleProcessVectorSampledTasks(object):
                     command == OBSERVATION_SPACE_COMMAND
                     or command == ACTION_SPACE_COMMAND
                 ):
+                    get_logger().debug(
+                        "Worker %s handling %s request.",
+                        worker_id,
+                        command,
+                    )
                     res = getattr(current_task, command)
+                    get_logger().debug(
+                        "Worker %s returning %s response.",
+                        worker_id,
+                        command,
+                    )
                     command, data = yield res
 
                 elif command == CALL_COMMAND:
@@ -1098,6 +1164,7 @@ class SingleProcessVectorSampledTasks(object):
 
                 elif command == RESET_COMMAND:
                     task_sampler.reset()
+                    get_logger().debug("Worker %s requesting task after reset.", worker_id)
                     current_task = task_sampler.next_task()
                     num_steps = 0
 
@@ -1163,8 +1230,10 @@ class SingleProcessVectorSampledTasks(object):
                 )
             )
 
+            get_logger().debug("Priming generator %s.", id)
             if next(generators[-1]) != "started":
                 raise RuntimeError("Generator failed to start.")
+            get_logger().debug("Generator %s primed.", id)
 
         return generators
 
