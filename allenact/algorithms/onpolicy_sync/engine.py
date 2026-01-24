@@ -269,10 +269,10 @@ class OnPolicyRLEngine(object):
             # "gloo" required during testing to ensure that `barrier()` doesn't time out.
             backend = "gloo" if cpu_device or self.mode == TEST_MODE_STR else "nccl"
             get_logger().debug(
-                f"Worker {self.worker_id}: initializing distributed {backend} backend with device {self.device}."
+                f"Worker {self.worker_id}: initializing distributed {backend} backend with device {self.device} and world size {self.num_workers}."
             )
             dist.init_process_group(  # type:ignore
-                backend=backend,
+                backend=backend,  # should we try multiple backends? "cpu:gloo,cuda:nccl"
                 store=self.store,
                 rank=self.worker_id,
                 world_size=self.num_workers,
@@ -1884,15 +1884,6 @@ class OnPolicyTrainer(OnPolicyRLEngine):
                     # `collect_step_across_all_task_samplers` if `num_paused != 0` here but this serves
                     # as a sanity check.
                     assert num_paused == 0
-                    
-                    if len(sampler_dones) == sum(sampler_dones):
-                        # All samplers are done
-                        get_logger().info(
-                            f"[{self.mode} worker {self.worker_id}] All samplers are done after"
-                            f" {step} steps (out of {cur_stage_training_settings.num_steps})"
-                            f" with {num_done} workers done"
-                        )
-                        break
 
                     if self.is_distributed:
                         # Preempt stragglers
@@ -1910,6 +1901,15 @@ class OnPolicyTrainer(OnPolicyRLEngine):
                             get_logger().debug(
                                 f"[{self.mode} worker {self.worker_id}] Preempted after {step}"
                                 f" steps (out of {cur_stage_training_settings.num_steps})"
+                                f" with {num_done} workers done"
+                            )
+                            break
+
+                        if len(sampler_dones) == sum(sampler_dones):
+                            # All samplers are done
+                            get_logger().info(
+                                f"[{self.mode} worker {self.worker_id}] All samplers are done after"
+                                f" {step} steps (out of {cur_stage_training_settings.num_steps})"
                                 f" with {num_done} workers done"
                             )
                             break
@@ -1936,8 +1936,8 @@ class OnPolicyTrainer(OnPolicyRLEngine):
                     )
 
                     # Ensure all workers are done before updating step counter
-                    get_logger().debug("[{} worker {}] Waiting for all workers to finish rollouts.".format(
-                        self.mode, self.worker_id
+                    get_logger().debug("[{} worker {} device {}] Waiting for all workers to finish rollouts.".format(
+                        self.mode, self.worker_id, self.device.index
                     ))
                     dist.barrier(
                         device_ids=(
@@ -1946,8 +1946,8 @@ class OnPolicyTrainer(OnPolicyRLEngine):
                             else [self.device.index]
                         )
                     )
-                    get_logger().debug("[{} worker {}] Finished waiting for all workers to finish rollouts.".format(
-                        self.mode, self.worker_id
+                    get_logger().debug("[{} worker {} device {}] Finished waiting for all workers to finish rollouts.".format(
+                        self.mode, self.worker_id, self.device.index
                     ))
                     
                     ndone = int(self.num_workers_done.get("done"))

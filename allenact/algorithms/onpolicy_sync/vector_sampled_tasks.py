@@ -234,7 +234,7 @@ class VectorSampledTasks:
 
         for i, write_fn in enumerate(self._connection_write_fns):
             get_logger().debug(
-                "Requesting observation space from VectorSampledTask worker %s.", i
+                "Requesting observation space from VectorSampledTask sampler %s.", i
             )
             write_fn((OBSERVATION_SPACE_COMMAND, None))
 
@@ -242,7 +242,7 @@ class VectorSampledTasks:
         observation_spaces: List[Any] = []
         for i, read_fn in enumerate(self._connection_read_fns):
             get_logger().debug(
-                "Waiting for observation space from VectorSampledTask worker %s.", i
+                "Waiting for observation space from VectorSampledTask sampler %s.", i
             )
             for space in read_fn(
                 timeout_to_use=5 * self.read_timeout
@@ -268,13 +268,13 @@ class VectorSampledTasks:
         self.observation_space = observation_spaces[0]
         for i, write_fn in enumerate(self._connection_write_fns):
             get_logger().debug(
-                "Requesting action space from VectorSampledTask worker %s.", i
+                "Requesting action space from VectorSampledTask sampler %s.", i
             )
             write_fn((ACTION_SPACE_COMMAND, None))
         self.action_spaces: List[Any] = []
         for i, read_fn in enumerate(self._connection_read_fns):
             get_logger().debug(
-                "Waiting for action space from VectorSampledTask worker %s.", i
+                "Waiting for action space from VectorSampledTask sampler %s.", i
             )
             for space in read_fn():
                 self.action_spaces.append(space)
@@ -1038,14 +1038,6 @@ class SingleProcessVectorSampledTasks(object):
                         command, data = yield step_result
                         continue
 
-                    if step_trace_every > 0 and (num_steps % step_trace_every) == 0:
-                        get_logger().debug(
-                            "Worker %s step start %s (device %s, house %s).",
-                            worker_id,
-                            num_steps + 1,
-                            sampler_fn_args.get("device"),
-                            current_task.task_info.get("house_index"),
-                        )
                     step_result: RLStepResult = current_task.step(data)
                     num_steps += 1
                     num_global += 1
