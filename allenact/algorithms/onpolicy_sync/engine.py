@@ -1100,7 +1100,7 @@ class OnPolicyRLEngine(object):
                             lagrangian_multiplier=self._lagrange.lagrangian_multiplier,
                             cost_limit = self._lagrange.cost_limit,
                             lambda_lr = self._lagrange.lambda_lr, 
-                            ep_costs = costs_summed_over_steps,
+                            ep_costs = costs_summed_over_steps.squeeze(),
                         )
 
                         per_epoch_info = {}
