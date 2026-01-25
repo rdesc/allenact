@@ -1022,7 +1022,6 @@ class SingleProcessVectorSampledTasks(object):
         try:
             get_logger().debug("Worker %s generator started.", worker_id)
             command, data = yield "started"
-            num_steps = 0
             num_global = 0
 
             while command != CLOSE_COMMAND:
@@ -1039,13 +1038,14 @@ class SingleProcessVectorSampledTasks(object):
                         continue
 
                     step_result: RLStepResult = current_task.step(data)
-                    num_steps += 1
                     num_global += 1
+
                     if current_task.is_done():
-                        get_logger().debug(
-                            f"Task in SingleProcessVectorSampledTasks on device {sampler_fn_args['device']} completed after {num_steps} steps."
-                        )
                         metrics = current_task.metrics()
+                        get_logger().debug(
+                            f"Task in SingleProcessVectorSampledTasks on device {sampler_fn_args['device']} completed after {current_task.num_steps_taken()} steps."
+                            f" Metrics: { {k: metrics[k] for k in metrics.keys() if k != 'task_info'} }"
+                        )
                         if metrics is not None and len(metrics) != 0:
                             if step_result.info is None:
                                 step_result = step_result.clone({"info": {}})
@@ -1070,7 +1070,6 @@ class SingleProcessVectorSampledTasks(object):
                                 f" rotation: {round(current_task.task_info['agent_y_rotation'], 2)}"
                                 f" natural language spec: '{current_task.task_info['natural_language_spec']}'"
                             )
-                            num_steps = 0
                             if current_task is None:
                                 step_result = step_result.clone({"observation": None})
                             else:
