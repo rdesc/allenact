@@ -951,10 +951,19 @@ class OnPolicyRLEngine(object):
         costs = self.training_pipeline.current_stage_storage[self.training_pipeline.rollout_storage_uuid].costs
 
         costs_summed_over_steps = costs.sum(dim=0)
-
         costs_mean = costs_summed_over_steps.mean()
 
-        self._lagrange.update_lagrange_multiplier(costs_mean) # TODO: add flag
+        lambda_logit = self._lagrange.lagrangian_multiplier
+        a0 = torch.tensor(0.02, device=lambda_logit.device, dtype=lambda_logit.dtype)
+        logits = torch.stack([a0, lambda_logit], dim=0)
+        lambda_c = torch.softmax(logits, dim=0)[1]  # scalar
+
+        cost_stat = costs_mean.detach()
+        self._lagrange.lambda_optimizer.zero_grad(set_to_none=True)
+        lambda_loss = -(lambda_c * (cost_stat - self._lagrange.cost_limit))
+        lambda_loss.backward()
+        self._lagrange.lambda_optimizer.step()
+
         # self._lagrange.update_lagrange_multiplier(self.training_pipeline.current_stage_storage[self.training_pipeline.rollout_storage_uuid].costs.mean())
         # print(costs_mean)
         training_settings = stage_component.training_settings
@@ -1097,7 +1106,7 @@ class OnPolicyRLEngine(object):
                             step_count=self.step_count,
                             batch=batch,
                             actor_critic_output=actor_critic_output_for_batch,
-                            lagrangian_multiplier=self._lagrange.lagrangian_multiplier,
+                            lagrangian_multiplier=lambda_c,
                             cost_limit = self._lagrange.cost_limit,
                             lambda_lr = self._lagrange.lambda_lr, 
                             ep_costs = costs_summed_over_steps.squeeze(),
