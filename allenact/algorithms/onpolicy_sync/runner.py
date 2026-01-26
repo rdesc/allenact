@@ -505,8 +505,15 @@ class OnPolicyRunner(object):
         try_restart_after_task_error: bool = False,
         save_ckpt_at_every_host: bool = False,
         cost_limit: float = None,
+        enable_lagrange: bool = True,
+        lagrangian_multiplier_init: float = 0.001,
+        lambda_lr: float = 0.035,
+        lambda_optimizer: str = "Adam",
     ):
-        assert cost_limit is not None, "cost_limit must be set"
+        if enable_lagrange:
+            assert cost_limit is not None, "cost_limit must be set"
+        elif cost_limit is None:
+            cost_limit = 0.0
         self._initialize_start_train_or_start_test()
 
         self._collect_valid_results = collect_valid_results
@@ -579,6 +586,10 @@ class OnPolicyRunner(object):
                 try_restart_after_task_error=try_restart_after_task_error,
                 save_ckpt_at_every_host=save_ckpt_at_every_host,
                 cost_limit=cost_limit,
+                enable_lagrange=enable_lagrange,
+                lagrangian_multiplier_init=lagrangian_multiplier_init,
+                lambda_lr=lambda_lr,
+                lambda_optimizer=lambda_optimizer,
             )
             train: BaseProcess = self.mp_ctx.Process(
                 target=self.train_loop,

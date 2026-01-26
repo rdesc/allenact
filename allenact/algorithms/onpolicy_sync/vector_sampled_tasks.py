@@ -479,6 +479,11 @@ class VectorSampledTasks:
                     assert len(args["house_inds"]) > 0, "Empty house_inds provided!"
                     args["house_inds_count"] = len(args["house_inds"])
                     args.pop("house_inds")
+                    if "task_spec_sampler_state" in args:
+                        ddict = args["task_spec_sampler_state"]
+                        ddict.pop("specs_for_current_house"); ddict.pop("house_inds"); ddict.pop("house_inds_rng_state")
+                        args["task_spec_sampler_state [SUPPRESSED]"] = ddict
+                        args.pop("task_spec_sampler_state")
                     sampler_fn_args_preview.append(args)
                 get_logger().info(
                     f"Starting {id}-th VectorSampledTask worker with args {sampler_fn_args_preview}"
@@ -1203,12 +1208,8 @@ class SingleProcessVectorSampledTasks(object):
         generators = []
         for id, current_sampler_fn_args in enumerate(sampler_fn_args):
             if self.should_log:
-                args = dict(current_sampler_fn_args)
-                args["house_inds (showing first 10)"] = args["house_inds"][:10]
-                args["house_inds_count"] = len(args["house_inds"])
-                args.pop("house_inds")
                 get_logger().info(
-                    f"Starting {id}-th SingleProcessVectorSampledTasks generator with args {args} for device {current_sampler_fn_args['device']}."
+                    f"Starting {id}-th SingleProcessVectorSampledTasks generator for device {current_sampler_fn_args['device']}."
                 )
             generators.append(
                 self._task_sampling_loop_generator_fn(
