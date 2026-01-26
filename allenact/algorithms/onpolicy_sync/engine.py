@@ -764,17 +764,12 @@ class OnPolicyRLEngine(object):
         outputs: List[RLStepResult] = self.vector_tasks.step(
             su.action_list(self.actor_critic.action_space, flat_actions)
         )
-
         # Save after task completion metrics
         for step_result in outputs:
             if step_result.info is not None:
                 if COMPLETE_TASK_METRICS_KEY in step_result.info:
                     new_metrics = step_result.info[COMPLETE_TASK_METRICS_KEY]
-                    new_metrics["lagrangian_multiplier"] = (
-                        0.0
-                        if not self.enable_lagrange
-                        else self._lagrange.lagrangian_multiplier.item()
-                    )
+                    new_metrics["multiplier_raw"] = self._lagrange.lagrangian_multiplier.item()
                     self.single_process_metrics.append(
                         new_metrics
                     )
@@ -952,7 +947,6 @@ class OnPolicyRLEngine(object):
             )
         # self._lagrange.update_lagrange_multiplier(self.distributed_weighted_sum(self.training_pipeline.current_stage_storage[self.training_pipeline.rollout_storage_uuid].costs.mean(), 1/self.num_workers))
         costs = self.training_pipeline.current_stage_storage[self.training_pipeline.rollout_storage_uuid].costs
-
         costs_summed_over_steps = costs.sum(dim=0)
         costs_mean = costs_summed_over_steps.mean()
 
@@ -1115,6 +1109,7 @@ class OnPolicyRLEngine(object):
                             batch=batch,
                             actor_critic_output=actor_critic_output_for_batch,
                             lagrangian_multiplier=lambda_c,
+                            multiplier_raw=self._lagrange.lagrangian_multiplier,
                             # cost_limit = self._lagrange.cost_limit,
                             # lambda_lr = self._lagrange.lambda_lr, 
                             ep_costs = costs_summed_over_steps.squeeze(),
@@ -1513,36 +1508,21 @@ class OnPolicyTrainer(OnPolicyRLEngine):
         return os.path.join(self.checkpoints_dir, model_name)
 
     def _lagrange_state_dict(self) -> Dict[str, Any]:
-        if not hasattr(self, "_lagrange"):
+        if not self.enable_lagrange:
             return {}
-        multiplier = self._lagrange.lagrangian_multiplier
-        if torch.is_tensor(multiplier):
-            multiplier = multiplier.detach().clone()
-        state: Dict[str, Any] = {"lagrangian_multiplier": multiplier}
-        if hasattr(self._lagrange, "lambda_optimizer"):
-            state["lambda_optimizer_state_dict"] = (
-                self._lagrange.lambda_optimizer.state_dict()
-            )
+        state: Dict[str, Any] = {"lagrangian_multiplier": self._lagrange.lagrangian_multiplier.item()}
+        state["lambda_optimizer_state_dict"] = (
+            self._lagrange.lambda_optimizer.state_dict()
+        )
         return state
 
     def _load_lagrange_state_dict(self, state: Dict[str, Any]) -> None:
         if not state or not hasattr(self, "_lagrange"):
             return
         if "lagrangian_multiplier" in state:
-            multiplier = state["lagrangian_multiplier"]
             target = self._lagrange.lagrangian_multiplier
-            if torch.is_tensor(target):
-                if not torch.is_tensor(multiplier):
-                    multiplier = torch.tensor(multiplier, dtype=target.dtype)
-                multiplier = multiplier.to(device=target.device, dtype=target.dtype)
-                target.data.copy_(multiplier)
-            else:
-                self._lagrange.lagrangian_multiplier = multiplier
-        if (
-            hasattr(self._lagrange, "lambda_optimizer")
-            and "lambda_optimizer_state_dict" in state
-            and state["lambda_optimizer_state_dict"] is not None
-        ):
+            with torch.no_grad():
+                target.fill_(state["lagrangian_multiplier"])
             self._lagrange.lambda_optimizer.load_state_dict(
                 state["lambda_optimizer_state_dict"]
             )
