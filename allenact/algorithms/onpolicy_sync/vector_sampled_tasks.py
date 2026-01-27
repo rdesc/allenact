@@ -29,7 +29,7 @@ import numpy as np
 from gym.spaces.dict import Dict as SpaceDict
 from setproctitle import setproctitle as ptitle
 
-from allenact.base_abstractions.misc import RLStepResult
+from allenact.base_abstractions.misc import RLStepResult, SafeRLStepResult
 from allenact.base_abstractions.sensor import SensorSuite, Sensor
 from allenact.base_abstractions.task import TaskSampler
 from allenact.utils.misc_utils import partition_sequence
@@ -965,6 +965,7 @@ class SingleProcessVectorSampledTasks(object):
         task_sampler = make_sampler_fn(**sampler_fn_args)
         current_task = task_sampler.next_task()
 
+        auto_resample_when_done = False
         if current_task is None:
             raise RuntimeError(
                 "Newly created task sampler had `None` as it's first task. This likely means that"
@@ -978,6 +979,17 @@ class SingleProcessVectorSampledTasks(object):
 
             while command != CLOSE_COMMAND:
                 if command == STEP_COMMAND:
+                    if current_task.is_done() and not auto_resample_when_done:
+                        step_result = SafeRLStepResult(
+                            observation=current_task.get_observations(),
+                            reward=0.0,
+                            cost=0.0,
+                            done=True,
+                            info=None,
+                        )
+                        command, data = yield step_result
+                        continue
+                    
                     step_result: RLStepResult = current_task.step(data)
                     if current_task.is_done():
                         metrics = current_task.metrics()

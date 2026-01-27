@@ -1278,7 +1278,7 @@ class OnPolicyTrainer(OnPolicyRLEngine):
             self.num_workers_steps = torch.distributed.PrefixStore(  # type:ignore
                 "num_workers_steps", self.store
             )
-            self.distributed_preemption_threshold = distributed_preemption_threshold
+            self.distributed_preemption_threshold = 1.0
             # Flag for finished worker in current epoch
             self.offpolicy_epoch_done = torch.distributed.PrefixStore(  # type:ignore
                 "offpolicy_epoch_done", self.store
@@ -1795,19 +1795,19 @@ class OnPolicyTrainer(OnPolicyRLEngine):
                         # 100 * distributed_preemption_threshold percentage of workers are finished collecting their
                         # rollout steps, and we have collected at least 25% but less than 90% of the steps.
                         num_done = int(self.num_workers_done.get("done"))
-                        if (
-                            num_done
-                            > self.distributed_preemption_threshold * self.num_workers
-                            and 0.25 * cur_stage_training_settings.num_steps
-                            <= step
-                            < 0.9 * cur_stage_training_settings.num_steps
-                        ):
-                            get_logger().debug(
-                                f"[{self.mode} worker {self.worker_id}] Preempted after {step}"
-                                f" steps (out of {cur_stage_training_settings.num_steps})"
-                                f" with {num_done} workers done"
-                            )
-                            break
+                        # if (
+                        #     num_done
+                        #     > self.distributed_preemption_threshold * self.num_workers
+                        #     and 0.25 * cur_stage_training_settings.num_steps
+                        #     <= step
+                        #     < 0.9 * cur_stage_training_settings.num_steps
+                        # ):
+                        #     get_logger().debug(
+                        #         f"[{self.mode} worker {self.worker_id}] Preempted after {step}"
+                        #         f" steps (out of {cur_stage_training_settings.num_steps})"
+                        #         f" with {num_done} workers done"
+                        #     )
+                        #     break
 
                 with torch.no_grad():
                     actor_critic_output, _ = self.actor_critic(
@@ -1920,13 +1920,14 @@ class OnPolicyTrainer(OnPolicyRLEngine):
                 self.tracking_info_list.clear()
                 self.last_log = self.training_pipeline.total_steps
 
-            if (
-                cur_stage_training_settings.advance_scene_rollout_period is not None
-            ) and (
-                self.training_pipeline.rollout_count
-                % cur_stage_training_settings.advance_scene_rollout_period
-                == 0
-            ):
+            # if (
+            #     cur_stage_training_settings.advance_scene_rollout_period is not None
+            # ) and (
+            #     self.training_pipeline.rollout_count
+            #     % cur_stage_training_settings.advance_scene_rollout_period
+            #     == 0
+            # ):
+            if True:
                 get_logger().info(
                     f"[{self.mode} worker {self.worker_id}] Force advance"
                     f" tasks with {self.training_pipeline.rollout_count} rollouts"
