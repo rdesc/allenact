@@ -964,6 +964,14 @@ class SingleProcessVectorSampledTasks(object):
 
         task_sampler = make_sampler_fn(**sampler_fn_args)
         current_task = task_sampler.next_task()
+        
+        get_logger().debug(
+            f"Sampled new task in SingleProcessVectorSampledTasks on device {sampler_fn_args['device']}."
+            f" house index: {current_task.task_info['house_index']}"
+            f" start position: { {k: round(v, 2) for k, v in current_task.task_info['agent_starting_position'].items()} }"
+            f" rotation: {round(current_task.task_info['agent_y_rotation'], 2)}"
+            f" natural language spec: '{current_task.task_info['natural_language_spec']}'"
+        )
 
         auto_resample_when_done = False
         if current_task is None:
@@ -1010,6 +1018,13 @@ class SingleProcessVectorSampledTasks(object):
 
                         if auto_resample_when_done:
                             current_task = task_sampler.next_task()
+                            get_logger().debug(
+                                f"Auto-resampling new task in SingleProcessVectorSampledTasks on device {sampler_fn_args['device']}."
+                                f" house index: {current_task.task_info['house_index']}"
+                                f" start position: { {k: round(v, 2) for k, v in current_task.task_info['agent_starting_position'].items()} }"
+                                f" rotation: {round(current_task.task_info['agent_y_rotation'], 2)}"
+                                f" natural language spec: '{current_task.task_info['natural_language_spec']}'"
+                            )
                             if current_task is None:
                                 step_result = step_result.clone({"observation": None})
                             else:
