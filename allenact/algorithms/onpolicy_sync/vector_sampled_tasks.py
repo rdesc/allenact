@@ -1040,6 +1040,13 @@ class SingleProcessVectorSampledTasks(object):
                     else:
                         current_task = task_sampler.next_task()
                     observations = current_task.get_observations()
+                    get_logger().debug(
+                        f"Sampled new task in SingleProcessVectorSampledTasks on device {sampler_fn_args['device']}."
+                        f" house index: {current_task.task_info['house_index']}"
+                        f" start position: { {k: round(v, 2) for k, v in current_task.task_info['agent_starting_position'].items()} }"
+                        f" rotation: {round(current_task.task_info['agent_y_rotation'], 2)}"
+                        f" natural language spec: '{current_task.task_info['natural_language_spec']}'"
+                    )
 
                     command, data = yield observations
 
