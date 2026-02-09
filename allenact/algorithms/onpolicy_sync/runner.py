@@ -503,6 +503,9 @@ class OnPolicyRunner(object):
         try_restart_after_task_error: bool = False,
         save_ckpt_at_every_host: bool = False,
         cost_limit: float = None,
+        advantage_method: Optional[str] = None,
+        use_constraints: Optional[bool] = None,
+        constraints_thresholds: Optional[Sequence[float]] = None,
     ):
         assert cost_limit is not None, "cost_limit must be set"
         self._initialize_start_train_or_start_test()
@@ -578,6 +581,14 @@ class OnPolicyRunner(object):
                 save_ckpt_at_every_host=save_ckpt_at_every_host,
                 cost_limit=cost_limit,
             )
+            if advantage_method is not None:
+                training_kwargs["advantage_method"] = advantage_method
+            if use_constraints is not None:
+                training_kwargs["use_constraints"] = use_constraints
+            if constraints_thresholds is not None:
+                training_kwargs["constraints_thresholds"] = list(
+                    constraints_thresholds
+                )
             train: BaseProcess = self.mp_ctx.Process(
                 target=self.train_loop,
                 kwargs=training_kwargs,

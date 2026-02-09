@@ -177,6 +177,7 @@ class PPOValue(AbstractActorCriticLoss):
         clip_param: float,
         use_clipped_value_loss=True,
         clip_decay: Optional[Callable[[int], float]] = None,
+        mask_out_other_rollouts: bool = False,
         *args,
         **kwargs
     ):
@@ -188,6 +189,7 @@ class PPOValue(AbstractActorCriticLoss):
         self.clip_param = clip_param
         self.use_clipped_value_loss = use_clipped_value_loss
         self.clip_decay = clip_decay if clip_decay is not None else (lambda x: 1.0)
+        self._mask_out_other_rollouts = mask_out_other_rollouts
 
     def loss(  # type: ignore
         self,
@@ -200,7 +202,6 @@ class PPOValue(AbstractActorCriticLoss):
         values = actor_critic_output.values
         clip_param = self.clip_param * self.clip_decay(step_count)
         masks = cast(torch.FloatTensor, batch["masks"])
-        # masks[0].fill_(1.0)
 
         if self.use_clipped_value_loss:
             value_pred_clipped = batch["values"] + (values - batch["values"]).clamp(
@@ -208,11 +209,20 @@ class PPOValue(AbstractActorCriticLoss):
             )
             value_losses = (values - batch["returns"]).pow(2)
             value_losses_clipped = (value_pred_clipped - batch["returns"]).pow(2)
-            value_loss = 0.5 * (torch.max(value_losses, value_losses_clipped) * masks).sum() / masks.sum().clamp(min=1)
+            
+            if self._mask_out_other_rollouts:
+                value_loss = 0.5 * (torch.max(value_losses, value_losses_clipped) * masks).sum() / masks.sum().clamp(min=1)
+            else:
+                value_loss = 0.5 * torch.max(value_losses, value_losses_clipped).mean()
         else:
-            value_loss = (
-                0.5 * ((cast(torch.FloatTensor, batch["returns"]) - values).pow(2) * masks).sum() / masks.sum().clamp(min=1)
-            )
+            if self._mask_out_other_rollouts:
+                value_loss = (
+                    0.5 * ((cast(torch.FloatTensor, batch["returns"]) - values).pow(2) * masks).sum() / masks.sum().clamp(min=1)
+                )
+            else:
+                value_loss = (
+                    0.5 * (cast(torch.FloatTensor, batch["returns"]) - values).pow(2).mean()
+                )
 
         return (
             value_loss,
@@ -236,6 +246,7 @@ class SafePPOValue(AbstractActorCriticLoss):
         clip_param: float,
         use_clipped_value_loss=True,
         clip_decay: Optional[Callable[[int], float]] = None,
+        mask_out_other_rollouts: bool = False,
         *args,
         **kwargs
     ):
@@ -247,6 +258,7 @@ class SafePPOValue(AbstractActorCriticLoss):
         self.clip_param = clip_param
         self.use_clipped_value_loss = use_clipped_value_loss
         self.clip_decay = clip_decay if clip_decay is not None else (lambda x: 1.0)
+        self._mask_out_other_rollouts = mask_out_other_rollouts
 
     def loss(  # type: ignore
         self,
@@ -268,11 +280,20 @@ class SafePPOValue(AbstractActorCriticLoss):
             )
             c_value_losses = (c_values - batch["c_returns"]).pow(2)
             c_value_losses_clipped = (c_value_pred_clipped - batch["c_returns"]).pow(2)
-            c_value_loss = 0.5 * (torch.max(c_value_losses, c_value_losses_clipped) *  masks).sum() / masks.sum().clamp(min=1)
+            
+            if self._mask_out_other_rollouts:
+                c_value_loss = 0.5 * (torch.max(c_value_losses, c_value_losses_clipped) *  masks).sum() / masks.sum().clamp(min=1)
+            else:
+                c_value_loss = 0.5 * torch.max(c_value_losses, c_value_losses_clipped).mean()
         else:
-            c_value_loss = (
-                0.5 * ((cast(torch.FloatTensor, batch["c_returns"]) - c_values).pow(2) * masks).sum() / masks.sum().clamp(min=1)
-            )
+            if self._mask_out_other_rollouts:
+                c_value_loss = (
+                    0.5 * ((cast(torch.FloatTensor, batch["c_returns"]) - c_values).pow(2) * masks).sum() / masks.sum().clamp(min=1)
+                )
+            else:
+                c_value_loss = (
+                    0.5 * (cast(torch.FloatTensor, batch["c_returns"]) - c_values).pow(2).mean()
+                )
 
         return (
             c_value_loss,

@@ -47,6 +47,11 @@ class ExperienceStorage(abc.ABC):
         c_value_preds: torch.Tensor,
         rewards: torch.Tensor,
         costs: torch.Tensor,
+        danger: torch.Tensor,
+        corner: torch.Tensor,
+        blind: torch.Tensor,
+        fragile: torch.Tensor,
+        critical: torch.Tensor,
         masks: torch.Tensor,
     ):
         """
@@ -59,6 +64,12 @@ class ExperienceStorage(abc.ABC):
         value_preds : Value predictions corresponding to the last observations
             (i.e. the states before taking `actions`).
         rewards : Rewards from taking `actions` in the last set of states.
+        costs : Costs from taking `actions` in the last set of states.
+        danger : Per-step danger cost.
+        corner : Per-step corner cost.
+        blind : Per-step blind spot cost.
+        fragile : Per-step fragile cost.
+        critical : Per-step critical cost.
         masks : Masks corresponding to the current states, having 0 entries where `observations` correspond to
             observations from the beginning of a new episode.
         """
@@ -159,6 +170,11 @@ class RolloutBlockStorage(RolloutStorage, MiniBatchStorageMixin):
         self._c_returns_full: Optional[torch.Tensor] = None
         self._rewards_full: Optional[torch.Tensor] = None
         self._costs_full: Optional[torch.Tensor] = None
+        self._danger_full: Optional[torch.Tensor] = None
+        self._corner_full: Optional[torch.Tensor] = None
+        self._blind_full: Optional[torch.Tensor] = None
+        self._fragile_full: Optional[torch.Tensor] = None
+        self._critical_full: Optional[torch.Tensor] = None
         self._action_log_probs_full: Optional[torch.Tensor] = None
 
         self.step = 0
@@ -242,6 +258,26 @@ class RolloutBlockStorage(RolloutStorage, MiniBatchStorageMixin):
         return self._costs_full[: self.step]
 
     @property
+    def danger(self) -> torch.Tensor:
+        return self._danger_full[: self.step]
+
+    @property
+    def corner(self) -> torch.Tensor:
+        return self._corner_full[: self.step]
+
+    @property
+    def blind(self) -> torch.Tensor:
+        return self._blind_full[: self.step]
+
+    @property
+    def fragile(self) -> torch.Tensor:
+        return self._fragile_full[: self.step]
+
+    @property
+    def critical(self) -> torch.Tensor:
+        return self._critical_full[: self.step]
+
+    @property
     def returns(self) -> torch.Tensor:
         return self._returns_full[: self.step + 1]
 
@@ -304,6 +340,11 @@ class RolloutBlockStorage(RolloutStorage, MiniBatchStorageMixin):
             "_masks_full",
             "_rewards_full",
             "_costs_full",
+            "_danger_full",
+            "_corner_full",
+            "_blind_full",
+            "_fragile_full",
+            "_critical_full",
             "_value_preds_full",
             "_c_value_preds_full",
             "_returns_full",
@@ -452,6 +493,11 @@ class RolloutBlockStorage(RolloutStorage, MiniBatchStorageMixin):
 
         self._rewards_full = pad_tensor_with_zeros(self._rewards_full)
         self._costs_full = pad_tensor_with_zeros(self._costs_full)
+        self._danger_full = pad_tensor_with_zeros(self._danger_full)
+        self._corner_full = pad_tensor_with_zeros(self._corner_full)
+        self._blind_full = pad_tensor_with_zeros(self._blind_full)
+        self._fragile_full = pad_tensor_with_zeros(self._fragile_full)
+        self._critical_full = pad_tensor_with_zeros(self._critical_full)
         self._value_preds_full = pad_tensor_with_zeros(self._value_preds_full)
         self._c_value_preds_full = pad_tensor_with_zeros(self._c_value_preds_full)
         self._returns_full = pad_tensor_with_zeros(self._returns_full)
@@ -470,6 +516,11 @@ class RolloutBlockStorage(RolloutStorage, MiniBatchStorageMixin):
         c_value_preds: torch.Tensor,
         rewards: torch.Tensor,
         costs: torch.Tensor,
+        danger: torch.Tensor,
+        corner: torch.Tensor,
+        blind: torch.Tensor,
+        fragile: torch.Tensor,
+        critical: torch.Tensor,
         masks: torch.Tensor,
     ):
         """See `ExperienceStorage.add` documentation."""
@@ -505,6 +556,22 @@ class RolloutBlockStorage(RolloutStorage, MiniBatchStorageMixin):
                 self.full_size, costs.unsqueeze(0)
             )  # add step
 
+            self._danger_full = self.create_tensor_storage(
+                self.full_size, danger.unsqueeze(0)
+            )
+            self._corner_full = self.create_tensor_storage(
+                self.full_size, corner.unsqueeze(0)
+            )
+            self._blind_full = self.create_tensor_storage(
+                self.full_size, blind.unsqueeze(0)
+            )
+            self._fragile_full = self.create_tensor_storage(
+                self.full_size, fragile.unsqueeze(0)
+            )
+            self._critical_full = self.create_tensor_storage(
+                self.full_size, critical.unsqueeze(0)
+            )
+
             value_returns_template = value_preds.unsqueeze(0)  # add step
             self._value_preds_full = self.create_tensor_storage(
                 self.full_size + 1, value_returns_template
@@ -529,6 +596,11 @@ class RolloutBlockStorage(RolloutStorage, MiniBatchStorageMixin):
         self._c_value_preds_full[self.step].copy_(c_value_preds)  # type:ignore
         self._rewards_full[self.step].copy_(rewards)  # type:ignore
         self._costs_full[self.step].copy_(costs)  # type:ignore
+        self._danger_full[self.step].copy_(danger)  # type:ignore
+        self._corner_full[self.step].copy_(corner)  # type:ignore
+        self._blind_full[self.step].copy_(blind)  # type:ignore
+        self._fragile_full[self.step].copy_(fragile)  # type:ignore
+        self._critical_full[self.step].copy_(critical)  # type:ignore
         self._action_log_probs_full[self.step].copy_(  # type:ignore
             action_log_probs
         )
@@ -559,6 +631,11 @@ class RolloutBlockStorage(RolloutStorage, MiniBatchStorageMixin):
             self._c_value_preds_full = self._c_value_preds_full[:, keep_list]
             self._rewards_full = self._rewards_full[:, keep_list]
             self._costs_full = self._costs_full[:, keep_list]
+            self._danger_full = self._danger_full[:, keep_list]
+            self._corner_full = self._corner_full[:, keep_list]
+            self._blind_full = self._blind_full[:, keep_list]
+            self._fragile_full = self._fragile_full[:, keep_list]
+            self._critical_full = self._critical_full[:, keep_list]
             self._returns_full = self._returns_full[:, keep_list]
             self._c_returns_full = self._c_returns_full[:, keep_list]
 

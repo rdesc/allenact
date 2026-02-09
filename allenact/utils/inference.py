@@ -114,7 +114,14 @@ class InferenceAgent:
                 actions=self.last_action_flat[0],
                 action_log_probs=dummy_val,
                 value_preds=dummy_val,
+                c_value_preds=dummy_val,
                 rewards=dummy_val,
+                costs=dummy_val,
+                danger=dummy_val,
+                corner=dummy_val,
+                blind=dummy_val,
+                fragile=dummy_val,
+                critical=dummy_val,
                 masks=torch.ones(
                     (1, 1), device=self.device
                 ),  # Always == 1 as we're in a single task until `reset`

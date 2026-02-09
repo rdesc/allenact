@@ -15,6 +15,7 @@ import filelock
 import torch
 import torch.distributed as dist  # type: ignore
 import torch.distributions  # type: ignore
+from torch.optim import Adam
 import torch.multiprocessing as mp  # type: ignore
 import torch.nn as nn
 import torch.optim as optim
@@ -47,6 +48,7 @@ from allenact.algorithms.onpolicy_sync.storage import (
 from allenact.algorithms.onpolicy_sync.vector_sampled_tasks import (
     COMPLETE_TASK_CALLBACK_KEY,
     COMPLETE_TASK_METRICS_KEY,
+    SAMPLER_COMMAND,
     SingleProcessVectorSampledTasks,
     VectorSampledTasks,
 )
@@ -56,7 +58,7 @@ from allenact.base_abstractions.misc import (
     ActorCriticOutput,
     GenericAbstractLoss,
     Memory,
-    RLStepResult,
+    SafeRLStepResult,
 )
 from allenact.utils import spaces_utils as su
 from allenact.utils.experiment_utils import (
@@ -340,6 +342,50 @@ class OnPolicyRLEngine(object):
                 read_timeout=DEBUG_VST_TIMEOUT if DEBUGGING else 1 * 60,
             )
         return self._vector_tasks
+
+    # def _task_sampler_state(self) -> Optional[List[Dict[str, Any]]]:
+    #     if self._vector_tasks is None:
+    #         return None
+
+    #     num_samplers = self.vector_tasks.num_unpaused_tasks
+    #     if num_samplers == 0:
+    #         return None
+
+    #     try:
+    #         return self.vector_tasks.command(
+    #             commands=SAMPLER_COMMAND,
+    #             data_list=[("state_dict", None)] * num_samplers,
+    #         )
+    #     except Exception as exc:
+    #         get_logger().warning(
+    #             f"[{self.mode} worker {self.worker_id}] Failed to snapshot task sampler state: {exc}"
+    #         )
+    #         return None
+
+    # def _load_task_sampler_state(self, state_list: Optional[List[Dict[str, Any]]]) -> None:
+    #     if state_list is None:
+    #         return
+
+    #     _ = self.vector_tasks
+    #     num_samplers = self.vector_tasks.num_unpaused_tasks
+    #     if num_samplers == 0:
+    #         return
+
+    #     if len(state_list) != num_samplers:
+    #         get_logger().warning(
+    #             f"[{self.mode} worker {self.worker_id}] Task sampler state count mismatch: "
+    #             f"{len(state_list)} (ckpt) vs {num_samplers} (current). Using min."
+    #         )
+
+    #     num_to_load = min(len(state_list), num_samplers)
+    #     self.vector_tasks.command(
+    #         commands=SAMPLER_COMMAND,
+    #         data_list=[
+    #             ("load_state_dict", [state_list[i]]) for i in range(num_to_load)
+    #         ],
+    #     )
+    #     # Refresh current tasks to match the restored sampler state.
+    #     self.vector_tasks.next_task()
 
     @staticmethod
     def worker_seeds(nprocesses: int, initial_seed: Optional[int]) -> List[int]:
@@ -654,7 +700,7 @@ class OnPolicyRLEngine(object):
                     # noinspection PyAttributeOutsideInit
                     self._probe_steps = -self._probe_steps
 
-    def  collect_step_across_all_task_samplers(
+    def collect_step_across_all_task_samplers(
         self,
         rollout_storage_uuid: str,
         uuid_to_storage: Dict[str, ExperienceStorage],
@@ -677,7 +723,7 @@ class OnPolicyRLEngine(object):
         )
 
         # Convert flattened actions into list of actions and send them
-        outputs: List[RLStepResult] = self.vector_tasks.step(
+        outputs: List[SafeRLStepResult] = self.vector_tasks.step(
             su.action_list(self.actor_critic.action_space, flat_actions)
         )
 
@@ -686,8 +732,13 @@ class OnPolicyRLEngine(object):
             if step_result.info is not None:
                 if COMPLETE_TASK_METRICS_KEY in step_result.info:
                     new_metrics = step_result.info[COMPLETE_TASK_METRICS_KEY]
-                    if hasattr(self, "_lagrange"):
-                        new_metrics["lagrangian_multiplier"] = self._lagrange.lagrangian_multiplier.item()
+                    if self.use_constraints:
+                        for idx, multiplier in enumerate(self.multiplier_params[1:]):
+                            new_metrics[
+                                f"raw_multipliers_values/{self.constraint_names[idx]}"
+                            ] = multiplier.item()
+                        new_metrics["raw_multipliers_values/reward_weight"] = self.multiplier_params[0].item()
+                        # new_metrics["lagrangian_multiplier"] = self._lagrange.lagrangian_multiplier.item()
                     self.single_process_metrics.append(
                         new_metrics
                     )
@@ -700,8 +751,24 @@ class OnPolicyRLEngine(object):
 
         rewards: Union[List, torch.Tensor]
         costs: Union[List, torch.Tensor]
+        danger: Union[List, torch.Tensor]
+        corner: Union[List, torch.Tensor]
+        blind: Union[List, torch.Tensor]
+        fragile: Union[List, torch.Tensor]
+        critical: Union[List, torch.Tensor]
 
-        observations, rewards, costs, dones, infos = [list(x) for x in zip(*outputs)]
+        (
+            observations,
+            rewards,
+            costs,
+            danger,
+            corner,
+            blind,
+            fragile,
+            critical,
+            dones,
+            infos,
+        ) = [list(x) for x in zip(*outputs)]  # TODO: we get the costs here.
 
         rewards = torch.tensor(
             rewards,
@@ -711,6 +778,36 @@ class OnPolicyRLEngine(object):
 
         costs = torch.tensor(
             costs,
+            dtype=torch.float,
+            device=self.device,  # type:ignore
+        )
+
+        danger = torch.tensor(
+            danger,
+            dtype=torch.float,
+            device=self.device,  # type:ignore
+        )
+
+        corner = torch.tensor(
+            corner,
+            dtype=torch.float,
+            device=self.device,  # type:ignore
+        )
+
+        blind = torch.tensor(
+            blind,
+            dtype=torch.float,
+            device=self.device,  # type:ignore
+        )
+
+        fragile = torch.tensor(
+            fragile,
+            dtype=torch.float,
+            device=self.device,  # type:ignore
+        )
+
+        critical = torch.tensor(
+            critical,
             dtype=torch.float,
             device=self.device,  # type:ignore
         )
@@ -726,6 +823,32 @@ class OnPolicyRLEngine(object):
             # Costs are of shape [sampler,]
             costs = costs.unsqueeze(-1)
         elif len(costs.shape) > 1:
+            raise NotImplementedError()
+
+        if len(danger.shape) == 1:
+            # Subcosts are of shape [sampler,]
+            danger = danger.unsqueeze(-1)
+        elif len(danger.shape) > 1:
+            raise NotImplementedError()
+
+        if len(corner.shape) == 1:
+            corner = corner.unsqueeze(-1)
+        elif len(corner.shape) > 1:
+            raise NotImplementedError()
+
+        if len(blind.shape) == 1:
+            blind = blind.unsqueeze(-1)
+        elif len(blind.shape) > 1:
+            raise NotImplementedError()
+
+        if len(fragile.shape) == 1:
+            fragile = fragile.unsqueeze(-1)
+        elif len(fragile.shape) > 1:
+            raise NotImplementedError()
+
+        if len(critical.shape) == 1:
+            critical = critical.unsqueeze(-1)
+        elif len(critical.shape) > 1:
             raise NotImplementedError()
 
         # If done then clean the history of observations.
@@ -774,6 +897,11 @@ class OnPolicyRLEngine(object):
             c_value_preds=actor_critic_output.c_values[0, keep],
             rewards=rewards[keep],
             costs=costs[keep],
+            danger=danger[keep],
+            corner=corner[keep],
+            blind=blind[keep],
+            fragile=fragile[keep],
+            critical=critical[keep],
             masks=masks[keep],
         )
         for storage in uuid_to_storage.values():
@@ -860,14 +988,78 @@ class OnPolicyRLEngine(object):
                     None if self.device == torch.device("cpu") else [self.device.index]
                 )
             )
+        
+        storage_obj = self.training_pipeline.current_stage_storage[self.training_pipeline.rollout_storage_uuid]
+        
+        
+        if self.use_constraints:
+            multipliers = torch.nn.functional.softmax(self.multiplier_params, dim=0)[1:]
+            
+            enforced_constraint_rates = []
+            
+            from remote_pdb import set_trace; set_trace()
+            
+            masks = storage_obj.masks.clone()[1:]  # [num_steps, num_samplers, 1]
+            trajectory_lengths = masks.sum(dim=0)  # [num_samplers, 1]
+
+            # state level constraints
+            corner_sum = 1 - ((masks * storage_obj.corner).sum(dim=0) / trajectory_lengths )  # [num_samplers, 1]
+            dangerous_sum = 1 - ((masks * storage_obj.danger).sum(dim=0) / trajectory_lengths )  # [num_samplers, 1]
+            
+            # trajectory-level constraints
+            blind_sum = 1 - ((masks * storage_obj.blind).sum(dim=0))  # [num_samplers, 1]
+            fragile_sum = 1 - ((masks * storage_obj.fragile).sum(dim=0) )
+            critical_sum = 1 - ((masks * storage_obj.critical).sum(dim=0) )  # [num_samplers, 1]
+            
+            # state-level constraints
+            # corner, dangerous
+            
+            # trajectory-level constraints
+            
+            for name in self.constraint_names:
+                sub_cost = getattr(storage_obj, name)
+                sub_cost_mean = self.distributed_weighted_sum(  # TODO: confirm this
+                    sub_cost.mean(), 1 / self.num_workers
+                    )
+                
+                enforced_constraint_rates.append(sub_cost_mean)
+                
+            enforced_constraints_thresholds = torch.tensor(self.constraints_thresholds, dtype=torch.float32, device=self.device)
+            enforced_constraint_rates = torch.tensor(enforced_constraint_rates, dtype=torch.float32, device=self.device)
+            
+            multiplier_losses = self.multiplier_signs * multipliers * (enforced_constraint_rates - enforced_constraints_thresholds)
+            multiplier_loss = torch.sum(multiplier_losses, dim=0)
+            self.multipliers_optim.zero_grad()
+            multiplier_loss.backward()
+            self.multipliers_optim.step()
+            
+            cost_weights = self.multiplier_signs * multipliers.detach()
+            reward_weight = 1. - torch.sum(torch.abs(cost_weights), axis=0)
+            
+            self.tracking_info_list.append(
+                TrackingInfo(type=TrackingInfoType.UPDATE_INFO,
+                            info={"multipliers/reward_weight": reward_weight.item()},
+                            n=1,
+                            storage_uuid=stage_component.storage_uuid,
+                            stage_component_uuid=stage_component.uuid,
+                            )
+                        )
+            for k, constraint_name in enumerate(self.constraint_names):
+                self.tracking_info_list.append(
+                    TrackingInfo(type=TrackingInfoType.UPDATE_INFO,
+                                info={f"multipliers/{constraint_name}": torch.abs(cost_weights[k]).item()},
+                                n=1,
+                                storage_uuid=stage_component.storage_uuid,
+                                stage_component_uuid=stage_component.uuid,
+                                )
+                            ) 
+
         # self._lagrange.update_lagrange_multiplier(self.distributed_weighted_sum(self.training_pipeline.current_stage_storage[self.training_pipeline.rollout_storage_uuid].costs.mean(), 1/self.num_workers))
-        costs = self.training_pipeline.current_stage_storage[self.training_pipeline.rollout_storage_uuid].costs
-
-        costs_summed_over_steps = costs.sum(dim=0)
-
-        costs_mean = costs_summed_over_steps.mean()
-
-        self._lagrange.update_lagrange_multiplier(costs_mean)
+        # costs = self.training_pipeline.current_stage_storage[self.training_pipeline.rollout_storage_uuid].costs
+        # costs_summed_over_steps = costs.sum(dim=0)
+        # costs_mean = costs_summed_over_steps.mean()
+        # self._lagrange.update_lagrange_multiplier(costs_mean)
+        
         # self._lagrange.update_lagrange_multiplier(self.training_pipeline.current_stage_storage[self.training_pipeline.rollout_storage_uuid].costs.mean())
         # print(costs_mean)
         training_settings = stage_component.training_settings
@@ -1006,15 +1198,28 @@ class OnPolicyRLEngine(object):
                                 )
                                 raise
 
-                        loss_return = loss.loss(
-                            step_count=self.step_count,
-                            batch=batch,
-                            actor_critic_output=actor_critic_output_for_batch,
-                            lagrangian_multiplier=self._lagrange.lagrangian_multiplier,
-                            cost_limit = self._lagrange.cost_limit,
-                            lambda_lr = self._lagrange.lambda_lr, 
-                            ep_costs = costs_mean,
-                        )
+                        if self.use_constraints:
+                            loss_return = loss.loss(
+                                step_count=self.step_count,
+                                batch=batch,
+                                actor_critic_output=actor_critic_output_for_batch,
+                                constraint_weights=cost_weights.tolist(),
+                                costs={name: getattr(storage_obj, name) for name in self.constraint_names},  # the satisfaction rate here right?
+                                reward_weight = reward_weight.item(),
+                                # cost_limit = self._lagrange.cost_limit,
+                                # lambda_lr = self._lagrange.lambda_lr, 
+                                # ep_costs = costs_mean,
+                                advantage_method = self.advantage_method
+                            )
+                        else:
+                            loss_return = loss.loss(
+                                step_count=self.step_count,
+                                batch=batch,
+                                actor_critic_output=actor_critic_output_for_batch,
+                                # cost_limit = self._lagrange.cost_limit,
+                                # lambda_lr = self._lagrange.lambda_lr, 
+                                # ep_costs = costs_mean,  # TODO: enable SafeVLA with lagrange here if specified!
+                            )
 
                         per_epoch_info = {}
                         if len(loss_return) == 2:
@@ -1261,6 +1466,25 @@ class OnPolicyTrainer(OnPolicyRLEngine):
             "lambda_lr": 0.035,
             "lambda_optimizer": "Adam",
         })
+        
+        self.use_constraints = kwargs.get("use_constraints", False)
+        # self.use_constraints = kwargs["use_constraints"]
+        self.advantage_method = kwargs["advantage_method"]  # 'scalarize_advantages' or 'scalarize_rewards'
+        assert self.advantage_method in ['scalarize_advantages', 'scalarize_rewards']
+        self.constraint_names = ["corner", "danger", "blind", "fragile", "critical"]
+        self.constraints_thresholds = kwargs.get("constraints_thresholds", [0.1] * len(self.constraint_names))  # list of floats
+        assert len(self.constraints_thresholds) == len(self.constraint_names), "Length of constraints_thresholds must match number of constraint names."
+    
+        if self.use_constraints:
+            self.multiplier_params = torch.full(size=(len(self.constraint_names)+1,),
+                                                    fill_value=0.02,
+                                                    requires_grad=True,
+                                                    device=self.device)
+
+            # params below from original implementation.
+            self.multipliers_optim = Adam([self.multiplier_params], lr=100*0.0003, eps=1e-5, betas=(0.9, 0.999))
+            self.constraint_thresholds = 1.0 - torch.FloatTensor(self.constraints_thresholds).to(self.device)
+            self.multiplier_signs = -1.0
 
         # noinspection PyProtectedMember
         self.lr_scheduler: Optional[_LRScheduler] = None
@@ -1361,12 +1585,21 @@ class OnPolicyTrainer(OnPolicyRLEngine):
                     save_dict["scheduler_state"] = cast(
                         _LRScheduler, self.lr_scheduler
                     ).state_dict()
+                if hasattr(self, "multiplier_params"):
+                    save_dict["multiplier_params"] = self.multiplier_params.detach().cpu()
+                if hasattr(self, "multipliers_optim"):
+                    save_dict["multipliers_optim_state_dict"] = (
+                        self.multipliers_optim.state_dict()
+                    )
+                # task_sampler_state = self._task_sampler_state()
+                # if task_sampler_state is not None:
+                #     save_dict["task_sampler_state"] = task_sampler_state
 
                 torch.save(save_dict, model_path)
         return model_path
 
     def aggregate_and_send_logging_package(
-        self,
+        self, 
         tracking_info_list: List[TrackingInfo],
         logging_pkg: Optional[LoggingPackage] = None,
         send_logging_package: bool = True,
@@ -1416,6 +1649,15 @@ class OnPolicyTrainer(OnPolicyRLEngine):
             save_dict["scheduler_state"] = cast(
                 _LRScheduler, self.lr_scheduler
             ).state_dict()
+        if hasattr(self, "multiplier_params"):
+            save_dict["multiplier_params"] = self.multiplier_params.detach().cpu()
+        if hasattr(self, "multipliers_optim"):
+            save_dict["multipliers_optim_state_dict"] = (
+                self.multipliers_optim.state_dict()
+            )
+        # task_sampler_state = self._task_sampler_state()
+        # if task_sampler_state is not None:
+        #     save_dict["task_sampler_state"] = task_sampler_state
 
         torch.save(save_dict, model_path)
 
@@ -1430,6 +1672,11 @@ class OnPolicyTrainer(OnPolicyRLEngine):
 
         ckpt = super().checkpoint_load(ckpt, restart_pipeline=restart_pipeline)
 
+        if "multiplier_params" in ckpt and hasattr(self, "multiplier_params"):
+            self.multiplier_params.data.copy_(
+                cast(torch.Tensor, ckpt["multiplier_params"]).to(self.device)
+            )
+
         if restart_pipeline:
             self.training_pipeline.restart_pipeline()
         else:
@@ -1437,8 +1684,19 @@ class OnPolicyTrainer(OnPolicyRLEngine):
             self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])  # type: ignore
             if self.lr_scheduler is not None and "scheduler_state" in ckpt:
                 self.lr_scheduler.load_state_dict(ckpt["scheduler_state"])  # type: ignore
+            if (
+                "multipliers_optim_state_dict" in ckpt
+                and hasattr(self, "multipliers_optim")
+            ):
+                self.multipliers_optim.load_state_dict(
+                    cast(Dict[str, Any], ckpt["multipliers_optim_state_dict"])
+                )
 
         self.deterministic_seeds()
+        # if not restart_pipeline and "task_sampler_state" in ckpt:
+        #     self._load_task_sampler_state(
+        #         cast(List[Dict[str, Any]], ckpt["task_sampler_state"])
+        #     )
 
         return ckpt
 
@@ -1920,14 +2178,13 @@ class OnPolicyTrainer(OnPolicyRLEngine):
                 self.tracking_info_list.clear()
                 self.last_log = self.training_pipeline.total_steps
 
-            # if (
-            #     cur_stage_training_settings.advance_scene_rollout_period is not None
-            # ) and (
-            #     self.training_pipeline.rollout_count
-            #     % cur_stage_training_settings.advance_scene_rollout_period
-            #     == 0
-            # ):
-            if True:
+            if (
+                cur_stage_training_settings.advance_scene_rollout_period is not None
+            ) and (
+                self.training_pipeline.rollout_count
+                % cur_stage_training_settings.advance_scene_rollout_period
+                == 0
+            ):
                 get_logger().info(
                     f"[{self.mode} worker {self.worker_id}] Force advance"
                     f" tasks with {self.training_pipeline.rollout_count} rollouts"

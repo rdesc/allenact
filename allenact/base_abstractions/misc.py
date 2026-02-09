@@ -55,6 +55,11 @@ class SafeRLStepResult(NamedTuple):
     observation: Optional[Any]
     reward: Optional[Union[float, List[float]]]
     cost: Optional[Union[float, List[float]]]
+    danger: Optional[Union[float, List[float]]]
+    corner: Optional[Union[float, List[float]]]
+    blind: Optional[Union[float, List[float]]]
+    fragile: Optional[Union[float, List[float]]]
+    critical: Optional[Union[float, List[float]]]
     done: Optional[bool]
     info: Optional[Dict[str, Any]]
 
@@ -67,6 +72,13 @@ class SafeRLStepResult(NamedTuple):
             ),
             reward=self.reward if "reward" not in new_info else new_info["reward"],
             cost=self.cost if "cost" not in new_info else new_info["cost"],
+            danger=self.danger if "danger" not in new_info else new_info["danger"],
+            corner=self.corner if "corner" not in new_info else new_info["corner"],
+            blind=self.blind if "blind" not in new_info else new_info["blind"],
+            fragile=self.fragile if "fragile" not in new_info else new_info["fragile"],
+            critical=(
+                self.critical if "critical" not in new_info else new_info["critical"]
+            ),
             done=self.done if "done" not in new_info else new_info["done"],
             info=self.info if "info" not in new_info else new_info["info"],
         )
@@ -78,6 +90,11 @@ class SafeRLStepResult(NamedTuple):
             ),
             reward=self.reward if other.reward is None else other.reward,
             cost=self.cost if other.cost is None else other.cost,
+            danger=self.danger if other.danger is None else other.danger,
+            corner=self.corner if other.corner is None else other.corner,
+            blind=self.blind if other.blind is None else other.blind,
+            fragile=self.fragile if other.fragile is None else other.fragile,
+            critical=self.critical if other.critical is None else other.critical,
             done=self.done if other.done is None else other.done,
             info={
                 **(self.info if self.info is not None else {}),

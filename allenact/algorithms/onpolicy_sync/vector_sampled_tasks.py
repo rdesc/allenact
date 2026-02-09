@@ -180,7 +180,8 @@ class VectorSampledTasks:
             else min(max_processes, self._num_task_samplers)
         )
 
-        self._auto_resample_when_done = auto_resample_when_done
+        from_sampler_arg = sampler_fn_args[0].get("auto_resample_when_done", None)
+        self._auto_resample_when_done = from_sampler_arg if from_sampler_arg is not None else auto_resample_when_done
 
         assert (multiprocessing_start_method is None) != (
             mp_ctx is None
@@ -973,7 +974,6 @@ class SingleProcessVectorSampledTasks(object):
             f" natural language spec: '{current_task.task_info['natural_language_spec']}'"
         )
 
-        auto_resample_when_done = False
         if current_task is None:
             raise RuntimeError(
                 "Newly created task sampler had `None` as it's first task. This likely means that"
@@ -992,6 +992,11 @@ class SingleProcessVectorSampledTasks(object):
                             observation=current_task.get_observations(),
                             reward=0.0,
                             cost=0.0,
+                            danger=0.0,
+                            corner=0.0,
+                            blind=0.0,
+                            fragile=0.0,
+                            critical=0.0,
                             done=True,
                             info=None,
                         )
