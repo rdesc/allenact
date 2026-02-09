@@ -1006,6 +1006,10 @@ class SingleProcessVectorSampledTasks(object):
                     step_result: RLStepResult = current_task.step(data)
                     if current_task.is_done():
                         metrics = current_task.metrics()
+                        get_logger().debug(
+                            f"Task in SingleProcessVectorSampledTasks on device {sampler_fn_args['device']} completed after {current_task.num_steps_taken()} steps."
+                            f" Metrics: { {k: metrics[k] for k in metrics.keys() if k != 'task_info'} }"
+                        )
                         if metrics is not None and len(metrics) != 0:
                             if step_result.info is None:
                                 step_result = step_result.clone({"info": {}})
