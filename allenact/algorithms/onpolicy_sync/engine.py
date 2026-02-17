@@ -242,6 +242,9 @@ class OnPolicyRLEngine(object):
                 f"[{self.mode} worker {self.worker_id}] model weights hash: {model_hash}"
             )
 
+        self._use_grpo = getattr(self.config.params, "use_grpo", False)
+        get_logger().info("GRPO is " + ("enabled" if self._use_grpo else "disabled"))
+
         self.is_distributed = False
         self.store: Optional[torch.distributed.TCPStore] = None  # type:ignore
         if self.num_workers > 1:
@@ -738,7 +741,8 @@ class OnPolicyRLEngine(object):
                                 f"raw_multipliers_values/{self.constraint_names[idx]}"
                             ] = multiplier.item()
                         new_metrics["raw_multipliers_values/reward_weight"] = self.multiplier_params[0].item()
-                        # new_metrics["lagrangian_multiplier"] = self._lagrange.lagrangian_multiplier.item()
+                    if hasattr(self, "_lagrange"):
+                        new_metrics["safevla_lagrangian_multiplier"] = self._lagrange.lagrangian_multiplier.item()
                     self.single_process_metrics.append(
                         new_metrics
                     )
@@ -991,13 +995,10 @@ class OnPolicyRLEngine(object):
         
         storage_obj = self.training_pipeline.current_stage_storage[self.training_pipeline.rollout_storage_uuid]
         
-        
         if self.use_constraints:
             multipliers = torch.nn.functional.softmax(self.multiplier_params, dim=0)[1:]
             
             enforced_constraint_rates = []
-            
-            from remote_pdb import set_trace; set_trace()
             
             masks = storage_obj.masks.clone()[1:]  # [num_steps, num_samplers, 1]
             trajectory_lengths = masks.sum(dim=0)  # [num_samplers, 1]
@@ -1055,10 +1056,10 @@ class OnPolicyRLEngine(object):
                             ) 
 
         # self._lagrange.update_lagrange_multiplier(self.distributed_weighted_sum(self.training_pipeline.current_stage_storage[self.training_pipeline.rollout_storage_uuid].costs.mean(), 1/self.num_workers))
-        # costs = self.training_pipeline.current_stage_storage[self.training_pipeline.rollout_storage_uuid].costs
-        # costs_summed_over_steps = costs.sum(dim=0)
-        # costs_mean = costs_summed_over_steps.mean()
-        # self._lagrange.update_lagrange_multiplier(costs_mean)
+        costs = self.training_pipeline.current_stage_storage[self.training_pipeline.rollout_storage_uuid].costs
+        costs_summed_over_steps = costs.sum(dim=0)
+        costs_mean = costs_summed_over_steps.mean()
+        self._lagrange.update_lagrange_multiplier(costs_mean)
         
         # self._lagrange.update_lagrange_multiplier(self.training_pipeline.current_stage_storage[self.training_pipeline.rollout_storage_uuid].costs.mean())
         # print(costs_mean)
@@ -1198,7 +1199,7 @@ class OnPolicyRLEngine(object):
                                 )
                                 raise
 
-                        if self.use_constraints:
+                        if self.use_constraints and self._use_grpo:
                             loss_return = loss.loss(
                                 step_count=self.step_count,
                                 batch=batch,
@@ -1216,9 +1217,11 @@ class OnPolicyRLEngine(object):
                                 step_count=self.step_count,
                                 batch=batch,
                                 actor_critic_output=actor_critic_output_for_batch,
+                                lagrangian_multiplier=self._lagrange.lagrangian_multiplier if self.use_constraints else torch.tensor(0.0),
                                 # cost_limit = self._lagrange.cost_limit,
                                 # lambda_lr = self._lagrange.lambda_lr, 
                                 # ep_costs = costs_mean,  # TODO: enable SafeVLA with lagrange here if specified!
+                                advantage_method = self.advantage_method
                             )
 
                         per_epoch_info = {}
@@ -2066,7 +2069,7 @@ class OnPolicyTrainer(OnPolicyRLEngine):
                         #         f" with {num_done} workers done"
                         #     )
                         #     break
-
+# TODO: update the step count when we do the masking thing
                 with torch.no_grad():
                     actor_critic_output, _ = self.actor_critic(
                         **rollout_storage.agent_input_for_next_step()

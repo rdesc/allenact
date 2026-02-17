@@ -787,6 +787,7 @@ class RolloutBlockStorage(RolloutStorage, MiniBatchStorageMixin):
             c_value_preds_batch = []
             return_batch = []
             c_return_batch = []
+            rewards_batch = []
             masks_batch = []
             old_action_log_probs_batch = []
             adv_targ = []
@@ -801,6 +802,7 @@ class RolloutBlockStorage(RolloutStorage, MiniBatchStorageMixin):
                 c_value_preds_batch.append(self.c_value_preds[:-1, ind])
                 return_batch.append(self.returns[:-1, ind])
                 c_return_batch.append(self.c_returns[:-1, ind])
+                rewards_batch.append(self.rewards[:, ind])
                 masks_batch.append(self.masks[:-1, ind])
                 old_action_log_probs_batch.append(self.action_log_probs[:, ind])
 
@@ -815,6 +817,7 @@ class RolloutBlockStorage(RolloutStorage, MiniBatchStorageMixin):
             c_value_preds_batch = torch.stack(c_value_preds_batch, 1)  # type:ignore
             return_batch = torch.stack(return_batch, 1)  # type:ignore
             c_return_batch = torch.stack(c_return_batch, 1)  # type:ignore
+            rewards_batch = torch.stack(rewards_batch, 1)  # type:ignore
             masks_batch = torch.stack(masks_batch, 1)  # type:ignore
             old_action_log_probs_batch = torch.stack(  # type:ignore
                 old_action_log_probs_batch, 1
@@ -833,6 +836,7 @@ class RolloutBlockStorage(RolloutStorage, MiniBatchStorageMixin):
                 "c_values": c_value_preds_batch,
                 "returns": return_batch,
                 "c_returns": c_return_batch,
+                "rewards": rewards_batch,
                 "masks": masks_batch,
                 "old_action_log_probs": old_action_log_probs_batch,
                 "adv_targ": adv_targ,
