@@ -832,6 +832,7 @@ class RolloutBlockStorage(RolloutStorage, MiniBatchStorageMixin):
                 "memory": memory_batch,
                 "actions": su.unflatten(self.action_space, actions_batch),
                 "prev_actions": su.unflatten(self.action_space, prev_actions_batch),
+                "sampler_ids": cur_samplers,
                 "values": value_preds_batch,
                 "c_values": c_value_preds_batch,
                 "returns": return_batch,

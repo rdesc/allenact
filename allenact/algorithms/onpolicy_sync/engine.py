@@ -9,7 +9,7 @@ import time
 import traceback
 from functools import partial
 from multiprocessing.context import BaseContext
-from typing import Any, Dict, List, Optional, Sequence, Union, cast
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, cast
 
 import filelock
 import torch
@@ -709,7 +709,7 @@ class OnPolicyRLEngine(object):
         uuid_to_storage: Dict[str, ExperienceStorage],
         visualizer=None,
         dist_wrapper_class=None,
-    ) -> int:
+    ) -> Tuple[int, List[int]]:
         rollout_storage = cast(RolloutStorage, uuid_to_storage[rollout_storage_uuid])
         actions, actor_critic_output, memory, _ = self.act(
             rollout_storage=rollout_storage,
@@ -773,6 +773,11 @@ class OnPolicyRLEngine(object):
             dones,
             infos,
         ) = [list(x) for x in zip(*outputs)]  # TODO: we get the costs here.
+
+        self.step_count -= sum(dones)
+        self.single_process_metrics.append({
+            "num_dones": sum(dones)
+        })
 
         rewards = torch.tensor(
             rewards,
@@ -923,7 +928,7 @@ class OnPolicyRLEngine(object):
             else:
                 visualizer.collect(actor_critic=actor_critic_output)
 
-        return npaused
+        return npaused, dones
 
     def distributed_weighted_sum(
         self,
@@ -2004,7 +2009,7 @@ class OnPolicyTrainer(OnPolicyRLEngine):
                     step += 1
 
                     try:
-                        num_paused = self.collect_step_across_all_task_samplers(
+                        num_paused, sampler_dones = self.collect_step_across_all_task_samplers(
                             rollout_storage_uuid=self.training_pipeline.rollout_storage_uuid,
                             uuid_to_storage=uuid_to_storage,
                         )
@@ -2069,7 +2074,16 @@ class OnPolicyTrainer(OnPolicyRLEngine):
                         #         f" with {num_done} workers done"
                         #     )
                         #     break
-# TODO: update the step count when we do the masking thing
+
+                    if len(sampler_dones) == sum(sampler_dones):
+                        # All samplers are done
+                        distributed_info = (f" with {num_done} workers done" if self.is_distributed else "")
+                        get_logger().info(
+                            f"[{self.mode} worker {self.worker_id}] All samplers are done after"
+                            f" {step} steps (out of {cur_stage_training_settings.num_steps}){distributed_info}"
+                        )
+                        break
+
                 with torch.no_grad():
                     actor_critic_output, _ = self.actor_critic(
                         **rollout_storage.agent_input_for_next_step()
