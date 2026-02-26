@@ -776,7 +776,7 @@ class OnPolicyRLEngine(object):
 
         self.step_count -= sum(dones)
         self.single_process_metrics.append({
-            "num_dones": sum(dones)
+            "num_dones": int(sum(dones))
         })
 
         rewards = torch.tensor(
@@ -1475,8 +1475,7 @@ class OnPolicyTrainer(OnPolicyRLEngine):
             "lambda_optimizer": "Adam",
         })
         
-        self.use_constraints = kwargs.get("use_constraints", False)
-        # self.use_constraints = kwargs["use_constraints"]
+        self.use_constraints = kwargs["use_constraints"]
         self.advantage_method = kwargs["advantage_method"]  # 'scalarize_advantages' or 'scalarize_rewards'
         assert self.advantage_method in ['scalarize_advantages', 'scalarize_rewards']
         self.constraint_names = ["corner", "danger", "blind", "fragile", "critical"]
@@ -1485,9 +1484,9 @@ class OnPolicyTrainer(OnPolicyRLEngine):
     
         if self.use_constraints:
             self.multiplier_params = torch.full(size=(len(self.constraint_names)+1,),
-                                                    fill_value=0.02,
-                                                    requires_grad=True,
-                                                    device=self.device)
+                                                fill_value=0.02,
+                                                requires_grad=True,
+                                                device=self.device)
 
             # params below from original implementation.
             self.multipliers_optim = Adam([self.multiplier_params], lr=100*0.0003, eps=1e-5, betas=(0.9, 0.999))

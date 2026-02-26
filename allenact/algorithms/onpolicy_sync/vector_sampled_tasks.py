@@ -450,7 +450,7 @@ class VectorSampledTasks:
 
             if self.should_log:
                 get_logger().info(
-                    f"Starting {id}-th VectorSampledTask worker with args {current_sampler_fn_args_list}"
+                    f"Starting {id}-th VectorSampledTask worker with args {SingleProcessVectorSampledTasks._summarize_args(current_sampler_fn_args_list)}"
                 )
 
             ps = self._mp_ctx.Process(  # type: ignore
@@ -1136,6 +1136,26 @@ class SingleProcessVectorSampledTasks(object):
                 )
             task_sampler.close()
 
+    @staticmethod
+    def _summarize_args(args: Union[List[Dict], Dict]):
+        list_len_threshold = 64
+
+        def _summarize(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {k: _summarize(v) for k, v in value.items()}
+
+            if isinstance(value, list):
+                if len(value) > list_len_threshold:
+                    return f"<list len={len(value)}>"
+                return [_summarize(v) for v in value]
+
+            if isinstance(value, tuple):
+                return tuple(_summarize(v) for v in value)
+
+            return value
+
+        return repr(_summarize(args))
+
     def _create_generators(
         self,
         make_sampler_fn: Callable[..., TaskSampler],
@@ -1147,7 +1167,7 @@ class SingleProcessVectorSampledTasks(object):
         for id, current_sampler_fn_args in enumerate(sampler_fn_args):
             if self.should_log:
                 get_logger().info(
-                    f"Starting {id}-th SingleProcessVectorSampledTasks generator with args {current_sampler_fn_args}."
+                    f"Starting {id}-th SingleProcessVectorSampledTasks generator with args {self._summarize_args(current_sampler_fn_args)}."
                 )
             generators.append(
                 self._task_sampling_loop_generator_fn(
