@@ -505,7 +505,8 @@ class OnPolicyRunner(object):
         cost_limit: float = None,
         advantage_method: Optional[str] = None,
         use_constraints: Optional[bool] = None,
-        constraints_thresholds: Optional[Sequence[float]] = None,
+        constraint_thresholds: Optional[Sequence[float]] = None,
+        constraint_names: Optional[Sequence[str]] = None,
     ):
         assert cost_limit is not None, "cost_limit must be set"
         self._initialize_start_train_or_start_test()
@@ -585,10 +586,10 @@ class OnPolicyRunner(object):
                 training_kwargs["advantage_method"] = advantage_method
             if use_constraints is not None:
                 training_kwargs["use_constraints"] = use_constraints
-            if constraints_thresholds is not None:
-                training_kwargs["constraints_thresholds"] = list(
-                    constraints_thresholds
-                )
+            if constraint_thresholds is not None:
+                training_kwargs["constraint_thresholds"] = list(constraint_thresholds)
+            if constraint_names is not None:
+                training_kwargs["constraint_names"] = list(constraint_names)
             train: BaseProcess = self.mp_ctx.Process(
                 target=self.train_loop,
                 kwargs=training_kwargs,

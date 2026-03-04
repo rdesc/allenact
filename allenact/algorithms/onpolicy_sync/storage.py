@@ -794,6 +794,11 @@ class RolloutBlockStorage(RolloutStorage, MiniBatchStorageMixin):
             norm_adv_targ = []
             c_adv_targ = []
             c_norm_adv_targ = []
+            corner_batch = []
+            danger_batch = []
+            blind_batch = []
+            fragile_batch = []
+            critical_batch = []
 
             for ind in cur_samplers:
                 actions_batch.append(self.actions[:, ind])
@@ -811,6 +816,12 @@ class RolloutBlockStorage(RolloutStorage, MiniBatchStorageMixin):
                 norm_adv_targ.append(self._normalized_advantages[:, ind])
                 c_norm_adv_targ.append(self._c_normalized_advantages[:, ind])
 
+                corner_batch.append(self._corner_full[:self.step, ind])
+                danger_batch.append(self._danger_full[:self.step, ind])
+                blind_batch.append(self._blind_full[:self.step, ind])
+                fragile_batch.append(self._fragile_full[:self.step, ind])
+                critical_batch.append(self._critical_full[:self.step, ind])
+
             actions_batch = torch.stack(actions_batch, 1)  # type:ignore
             prev_actions_batch = torch.stack(prev_actions_batch, 1)  # type:ignore
             value_preds_batch = torch.stack(value_preds_batch, 1)  # type:ignore
@@ -826,6 +837,11 @@ class RolloutBlockStorage(RolloutStorage, MiniBatchStorageMixin):
             norm_adv_targ = torch.stack(norm_adv_targ, 1)  # type:ignore
             c_adv_targ = torch.stack(c_adv_targ, 1)  # type:ignore
             c_norm_adv_targ = torch.stack(c_norm_adv_targ, 1)  # type:ignore
+            corner_batch = torch.stack(corner_batch, 1)  # type:ignore
+            danger_batch = torch.stack(danger_batch, 1)  # type:ignore
+            blind_batch = torch.stack(blind_batch, 1)  # type:ignore
+            fragile_batch = torch.stack(fragile_batch, 1)  # type:ignore
+            critical_batch = torch.stack(critical_batch, 1)  # type:ignore
 
             yield {
                 "observations": observations_batch,
@@ -844,6 +860,11 @@ class RolloutBlockStorage(RolloutStorage, MiniBatchStorageMixin):
                 "c_adv_targ": c_adv_targ,
                 "norm_adv_targ": norm_adv_targ,
                 "c_norm_adv_targ": c_norm_adv_targ,
+                "corner": corner_batch,
+                "danger": danger_batch,
+                "blind": blind_batch,
+                "fragile": fragile_batch,
+                "critical": critical_batch,
                 "bsize": int(np.prod(masks_batch.shape[:2])),
             }
 

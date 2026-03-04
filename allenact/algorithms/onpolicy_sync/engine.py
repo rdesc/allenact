@@ -243,7 +243,8 @@ class OnPolicyRLEngine(object):
             )
 
         self._use_grpo = getattr(self.config.params, "use_grpo", False)
-        get_logger().info("GRPO is " + ("enabled" if self._use_grpo else "disabled"))
+        self._grpo_num_generations = getattr(self.config.params, "grpo_num_generations", 0)
+        get_logger().info("GRPO is " + ("enabled with " + str(self._grpo_num_generations) + " generations" if self._use_grpo else "disabled"))
 
         self.is_distributed = False
         self.store: Optional[torch.distributed.TCPStore] = None  # type:ignore
@@ -735,12 +736,6 @@ class OnPolicyRLEngine(object):
             if step_result.info is not None:
                 if COMPLETE_TASK_METRICS_KEY in step_result.info:
                     new_metrics = step_result.info[COMPLETE_TASK_METRICS_KEY]
-                    if self.use_constraints:
-                        for idx, multiplier in enumerate(self.multiplier_params[1:]):
-                            new_metrics[
-                                f"raw_multipliers_values/{self.constraint_names[idx]}"
-                            ] = multiplier.item()
-                        new_metrics["raw_multipliers_values/reward_weight"] = self.multiplier_params[0].item()
                     if hasattr(self, "_lagrange"):
                         new_metrics["safevla_lagrangian_multiplier"] = self._lagrange.lagrangian_multiplier.item()
                     self.single_process_metrics.append(
@@ -1000,74 +995,89 @@ class OnPolicyRLEngine(object):
         
         storage_obj = self.training_pipeline.current_stage_storage[self.training_pipeline.rollout_storage_uuid]
         
+        tracking_info_partial = partial(
+            TrackingInfo,
+            type=TrackingInfoType.UPDATE_INFO,
+            n=1,
+            storage_uuid=stage_component.storage_uuid,
+            stage_component_uuid=stage_component.uuid,
+        )
+        
+        enforced_constraint_rates = []  # local to this worker
+        enforced_constraint_rates_agg = []  # aggregated across workers
+        
+        masks = storage_obj.masks.clone()[1:]  # [num_steps, num_samplers, 1]
+        trajectory_lengths = masks.sum(dim=0)  # [num_samplers, 1]
+        
+        group_size = self._grpo_num_generations if self._use_grpo else len(trajectory_lengths)
+        
+        for name in self.constraint_names:
+            sub_cost = getattr(storage_obj, name) * masks # [num_steps, num_samplers, 1]
+            
+            sub_cost_mean = (
+                sub_cost.view(sub_cost.shape[0], -1, group_size).sum((0,2)) /
+                trajectory_lengths.view(-1, group_size).sum(1)  # (num_samplers // group_size, )
+            )
+            assert sub_cost_mean.shape[0] == trajectory_lengths.shape[0] // group_size
+
+            sub_cost_mean_agg = self.distributed_weighted_sum(
+                sub_cost.sum() / trajectory_lengths.sum(), 1 / self.num_workers
+                )
+
+            enforced_constraint_rates.append(sub_cost_mean)
+            enforced_constraint_rates_agg.append(sub_cost_mean_agg)
+
+            self.tracking_info_list.append(
+                tracking_info_partial(info={f"constraints/{name}": sub_cost_mean_agg},)
+            )
+            
+        enforced_constraint_rates = torch.stack(enforced_constraint_rates, dim=1)  # [num_samplers // group_size, num_constraints]
+        enforced_constraint_rates_agg = torch.tensor(enforced_constraint_rates_agg, dtype=torch.float32, device=self.device)
+        
+        # only do the update if we are using constraints
         if self.use_constraints:
             multipliers = torch.nn.functional.softmax(self.multiplier_params, dim=0)[1:]
-            
-            enforced_constraint_rates = []
-            
-            masks = storage_obj.masks.clone()[1:]  # [num_steps, num_samplers, 1]
-            trajectory_lengths = masks.sum(dim=0)  # [num_samplers, 1]
-
-            # state level constraints
-            corner_sum = 1 - ((masks * storage_obj.corner).sum(dim=0) / trajectory_lengths )  # [num_samplers, 1]
-            dangerous_sum = 1 - ((masks * storage_obj.danger).sum(dim=0) / trajectory_lengths )  # [num_samplers, 1]
-            
-            # trajectory-level constraints
-            blind_sum = 1 - ((masks * storage_obj.blind).sum(dim=0))  # [num_samplers, 1]
-            fragile_sum = 1 - ((masks * storage_obj.fragile).sum(dim=0) )
-            critical_sum = 1 - ((masks * storage_obj.critical).sum(dim=0) )  # [num_samplers, 1]
-            
-            # state-level constraints
-            # corner, dangerous
-            
-            # trajectory-level constraints
-            
-            for name in self.constraint_names:
-                sub_cost = getattr(storage_obj, name)
-                sub_cost_mean = self.distributed_weighted_sum(  # TODO: confirm this
-                    sub_cost.mean(), 1 / self.num_workers
-                    )
-                
-                enforced_constraint_rates.append(sub_cost_mean)
-                
-            enforced_constraints_thresholds = torch.tensor(self.constraints_thresholds, dtype=torch.float32, device=self.device)
-            enforced_constraint_rates = torch.tensor(enforced_constraint_rates, dtype=torch.float32, device=self.device)
-            
-            multiplier_losses = self.multiplier_signs * multipliers * (enforced_constraint_rates - enforced_constraints_thresholds)
+            multiplier_losses = self.multiplier_signs * multipliers * (enforced_constraint_rates_agg - self.constraint_thresholds)
             multiplier_loss = torch.sum(multiplier_losses, dim=0)
             self.multipliers_optim.zero_grad()
             multiplier_loss.backward()
             self.multipliers_optim.step()
-            
+
             cost_weights = self.multiplier_signs * multipliers.detach()
             reward_weight = 1. - torch.sum(torch.abs(cost_weights), axis=0)
             
+            # logging to wandb
             self.tracking_info_list.append(
-                TrackingInfo(type=TrackingInfoType.UPDATE_INFO,
-                            info={"multipliers/reward_weight": reward_weight.item()},
-                            n=1,
-                            storage_uuid=stage_component.storage_uuid,
-                            stage_component_uuid=stage_component.uuid,
-                            )
-                        )
+                tracking_info_partial(
+                    info={"multipliers/reward_weight": reward_weight.item()},)
+            )
+            self.tracking_info_list.append(
+                tracking_info_partial(
+                    info={"raw_multipliers_values/reward_weight": self.multiplier_params[0].item()},)
+            )
             for k, constraint_name in enumerate(self.constraint_names):
                 self.tracking_info_list.append(
-                    TrackingInfo(type=TrackingInfoType.UPDATE_INFO,
-                                info={f"multipliers/{constraint_name}": torch.abs(cost_weights[k]).item()},
-                                n=1,
-                                storage_uuid=stage_component.storage_uuid,
-                                stage_component_uuid=stage_component.uuid,
-                                )
-                            ) 
+                    tracking_info_partial(
+                        info={f"multipliers/{constraint_name}": torch.abs(cost_weights[k]).item()},)
+                )
+                self.tracking_info_list.append(
+                    tracking_info_partial(
+                        info={f"raw_multipliers_values/{constraint_name}": self.multiplier_params[k+1].item()},)
+                )
 
+        costs = self.training_pipeline.current_stage_storage[self.training_pipeline.rollout_storage_uuid].costs * masks
+        costs_mean = self.distributed_weighted_sum(costs.sum() / costs.shape[1], 1 / self.num_workers)  # this is averaging the costs.sum() across workers
+
+        # commented out in original SafeVLA code
         # self._lagrange.update_lagrange_multiplier(self.distributed_weighted_sum(self.training_pipeline.current_stage_storage[self.training_pipeline.rollout_storage_uuid].costs.mean(), 1/self.num_workers))
-        costs = self.training_pipeline.current_stage_storage[self.training_pipeline.rollout_storage_uuid].costs
-        costs_summed_over_steps = costs.sum(dim=0)
-        costs_mean = costs_summed_over_steps.mean()
+
+        # original SafeVLA code
+        # costs = self.training_pipeline.current_stage_storage[self.training_pipeline.rollout_storage_uuid].costs
+        # costs_summed_over_steps = costs.sum(dim=0)
+        # costs_mean = costs_summed_over_steps.mean()
+
         self._lagrange.update_lagrange_multiplier(costs_mean)
         
-        # self._lagrange.update_lagrange_multiplier(self.training_pipeline.current_stage_storage[self.training_pipeline.rollout_storage_uuid].costs.mean())
-        # print(costs_mean)
         training_settings = stage_component.training_settings
 
         loss_names = stage_component.loss_names
@@ -1209,12 +1219,9 @@ class OnPolicyRLEngine(object):
                                 step_count=self.step_count,
                                 batch=batch,
                                 actor_critic_output=actor_critic_output_for_batch,
-                                constraint_weights=cost_weights.tolist(),
-                                costs={name: getattr(storage_obj, name) for name in self.constraint_names},  # the satisfaction rate here right?
+                                constraint_weights=cost_weights,  # lagrange multipliers
+                                costs=enforced_constraint_rates,  # constraint satisfaction rates 
                                 reward_weight = reward_weight.item(),
-                                # cost_limit = self._lagrange.cost_limit,
-                                # lambda_lr = self._lagrange.lambda_lr, 
-                                # ep_costs = costs_mean,
                                 advantage_method = self.advantage_method
                             )
                         else:
@@ -1223,9 +1230,6 @@ class OnPolicyRLEngine(object):
                                 batch=batch,
                                 actor_critic_output=actor_critic_output_for_batch,
                                 lagrangian_multiplier=self._lagrange.lagrangian_multiplier if self.use_constraints else torch.tensor(0.0),
-                                # cost_limit = self._lagrange.cost_limit,
-                                # lambda_lr = self._lagrange.lambda_lr, 
-                                # ep_costs = costs_mean,  # TODO: enable SafeVLA with lagrange here if specified!
                                 advantage_method = self.advantage_method
                             )
 
@@ -1478,9 +1482,24 @@ class OnPolicyTrainer(OnPolicyRLEngine):
         self.use_constraints = kwargs["use_constraints"]
         self.advantage_method = kwargs["advantage_method"]  # 'scalarize_advantages' or 'scalarize_rewards'
         assert self.advantage_method in ['scalarize_advantages', 'scalarize_rewards']
+
+        # state level constraints: corner, danger
+        # trajectory-level constraints: blind, fragile, critical
         self.constraint_names = ["corner", "danger", "blind", "fragile", "critical"]
-        self.constraints_thresholds = kwargs.get("constraints_thresholds", [0.1] * len(self.constraint_names))  # list of floats
-        assert len(self.constraints_thresholds) == len(self.constraint_names), "Length of constraints_thresholds must match number of constraint names."
+        self.constraint_thresholds = []
+        default_threshold = 0.1
+
+        args_constraint_names = kwargs.get("constraint_names", self.constraint_names)
+        args_constraint_thresholds = kwargs.get("constraint_thresholds", [default_threshold] * len(args_constraint_names))
+        assert len(args_constraint_names) == len(args_constraint_thresholds), "Length of constraint_thresholds must match number of constraint names."
+
+        # match the order of the constraint names from args
+        for constraint_name in self.constraint_names:
+            if constraint_name in args_constraint_names:
+                index = args_constraint_names.index(constraint_name)
+                self.constraint_thresholds.append(args_constraint_thresholds[index])
+            else:
+                self.constraint_thresholds.append(default_threshold)  # default threshold if not specified in args
     
         if self.use_constraints:
             self.multiplier_params = torch.full(size=(len(self.constraint_names)+1,),
@@ -1490,7 +1509,7 @@ class OnPolicyTrainer(OnPolicyRLEngine):
 
             # params below from original implementation.
             self.multipliers_optim = Adam([self.multiplier_params], lr=100*0.0003, eps=1e-5, betas=(0.9, 0.999))
-            self.constraint_thresholds = 1.0 - torch.FloatTensor(self.constraints_thresholds).to(self.device)
+            self.constraint_thresholds = torch.FloatTensor(self.constraint_thresholds).to(self.device)
             self.multiplier_signs = -1.0
 
         # noinspection PyProtectedMember
@@ -1598,6 +1617,22 @@ class OnPolicyTrainer(OnPolicyRLEngine):
                     save_dict["multipliers_optim_state_dict"] = (
                         self.multipliers_optim.state_dict()
                     )
+                if hasattr(self, "_lagrange") and hasattr(
+                    self._lagrange, "lagrangian_multiplier"
+                ):
+                    lagrangian_multiplier = self._lagrange.lagrangian_multiplier
+                    if torch.is_tensor(lagrangian_multiplier):
+                        save_dict["lagrangian_multiplier"] = (
+                            lagrangian_multiplier.detach().cpu()
+                        )
+                    else:
+                        save_dict["lagrangian_multiplier"] = float(lagrangian_multiplier)
+                if hasattr(self, "_lagrange") and hasattr(
+                    self._lagrange, "lambda_optimizer"
+                ):
+                    save_dict["lagrange_lambda_optimizer_state_dict"] = (
+                        self._lagrange.lambda_optimizer.state_dict()
+                    )
                 # task_sampler_state = self._task_sampler_state()
                 # if task_sampler_state is not None:
                 #     save_dict["task_sampler_state"] = task_sampler_state
@@ -1662,6 +1697,15 @@ class OnPolicyTrainer(OnPolicyRLEngine):
             save_dict["multipliers_optim_state_dict"] = (
                 self.multipliers_optim.state_dict()
             )
+        if hasattr(self, "_lagrange") and self._lagrange is not None:
+            lagrangian_multiplier = self._lagrange.lagrangian_multiplier
+            if torch.is_tensor(lagrangian_multiplier):
+                save_dict["lagrangian_multiplier"] = lagrangian_multiplier.detach().cpu()
+            else:
+                save_dict["lagrangian_multiplier"] = float(lagrangian_multiplier)
+            save_dict["lagrange_lambda_optimizer_state_dict"] = (
+                self._lagrange.lambda_optimizer.state_dict()
+            )
         # task_sampler_state = self._task_sampler_state()
         # if task_sampler_state is not None:
         #     save_dict["task_sampler_state"] = task_sampler_state
@@ -1684,6 +1728,33 @@ class OnPolicyTrainer(OnPolicyRLEngine):
                 cast(torch.Tensor, ckpt["multiplier_params"]).to(self.device)
             )
 
+        if (
+            "lagrangian_multiplier" in ckpt
+            and hasattr(self, "_lagrange")
+            and self._lagrange is not None
+        ):
+            current_lagrangian_multiplier = self._lagrange.lagrangian_multiplier
+            loaded_lagrangian_multiplier = ckpt["lagrangian_multiplier"]
+
+            if torch.is_tensor(current_lagrangian_multiplier):
+                if torch.is_tensor(loaded_lagrangian_multiplier):
+                    current_lagrangian_multiplier.data.copy_(
+                        loaded_lagrangian_multiplier.to(
+                            device=current_lagrangian_multiplier.device,
+                            dtype=current_lagrangian_multiplier.dtype,
+                        )
+                    )
+                else:
+                    current_lagrangian_multiplier.data.fill_(
+                        float(loaded_lagrangian_multiplier)
+                    )
+            else:
+                if torch.is_tensor(loaded_lagrangian_multiplier):
+                    loaded_lagrangian_multiplier = loaded_lagrangian_multiplier.item()
+                self._lagrange.lagrangian_multiplier = float(
+                    loaded_lagrangian_multiplier
+                )
+
         if restart_pipeline:
             self.training_pipeline.restart_pipeline()
         else:
@@ -1697,6 +1768,14 @@ class OnPolicyTrainer(OnPolicyRLEngine):
             ):
                 self.multipliers_optim.load_state_dict(
                     cast(Dict[str, Any], ckpt["multipliers_optim_state_dict"])
+                )
+            if (
+                "lagrange_lambda_optimizer_state_dict" in ckpt
+                and hasattr(self, "_lagrange")
+                and self._lagrange is not None
+            ):
+                self._lagrange.lambda_optimizer.load_state_dict(
+                    cast(Dict[str, Any], ckpt["lagrange_lambda_optimizer_state_dict"])
                 )
 
         self.deterministic_seeds()
