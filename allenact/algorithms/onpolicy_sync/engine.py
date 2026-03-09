@@ -48,7 +48,6 @@ from allenact.algorithms.onpolicy_sync.storage import (
 from allenact.algorithms.onpolicy_sync.vector_sampled_tasks import (
     COMPLETE_TASK_CALLBACK_KEY,
     COMPLETE_TASK_METRICS_KEY,
-    SAMPLER_COMMAND,
     SingleProcessVectorSampledTasks,
     VectorSampledTasks,
 )
@@ -347,50 +346,6 @@ class OnPolicyRLEngine(object):
             )
         return self._vector_tasks
 
-    # def _task_sampler_state(self) -> Optional[List[Dict[str, Any]]]:
-    #     if self._vector_tasks is None:
-    #         return None
-
-    #     num_samplers = self.vector_tasks.num_unpaused_tasks
-    #     if num_samplers == 0:
-    #         return None
-
-    #     try:
-    #         return self.vector_tasks.command(
-    #             commands=SAMPLER_COMMAND,
-    #             data_list=[("state_dict", None)] * num_samplers,
-    #         )
-    #     except Exception as exc:
-    #         get_logger().warning(
-    #             f"[{self.mode} worker {self.worker_id}] Failed to snapshot task sampler state: {exc}"
-    #         )
-    #         return None
-
-    # def _load_task_sampler_state(self, state_list: Optional[List[Dict[str, Any]]]) -> None:
-    #     if state_list is None:
-    #         return
-
-    #     _ = self.vector_tasks
-    #     num_samplers = self.vector_tasks.num_unpaused_tasks
-    #     if num_samplers == 0:
-    #         return
-
-    #     if len(state_list) != num_samplers:
-    #         get_logger().warning(
-    #             f"[{self.mode} worker {self.worker_id}] Task sampler state count mismatch: "
-    #             f"{len(state_list)} (ckpt) vs {num_samplers} (current). Using min."
-    #         )
-
-    #     num_to_load = min(len(state_list), num_samplers)
-    #     self.vector_tasks.command(
-    #         commands=SAMPLER_COMMAND,
-    #         data_list=[
-    #             ("load_state_dict", [state_list[i]]) for i in range(num_to_load)
-    #         ],
-    #     )
-    #     # Refresh current tasks to match the restored sampler state.
-    #     self.vector_tasks.next_task()
-
     @staticmethod
     def worker_seeds(nprocesses: int, initial_seed: Optional[int]) -> List[int]:
         """Create a collection of seeds for workers without modifying the RNG
@@ -441,6 +396,7 @@ class OnPolicyRLEngine(object):
                 total_processes=total_processes,
                 devices=sampler_devices_as_ints,
                 seeds=seeds,
+                total_steps=self.training_pipeline.total_steps,
             )
             for it in range(self.num_samplers)
         ]
@@ -1220,9 +1176,10 @@ class OnPolicyRLEngine(object):
                                 batch=batch,
                                 actor_critic_output=actor_critic_output_for_batch,
                                 constraint_weights=cost_weights,  # lagrange multipliers
-                                costs=enforced_constraint_rates,  # constraint satisfaction rates 
-                                reward_weight = reward_weight.item(),
-                                advantage_method = self.advantage_method
+                                constraint_names=self.constraint_names,
+                                costs=enforced_constraint_rates,  # constraint satisfaction rates
+                                reward_weight=reward_weight.item(),
+                                lagrangian_multiplier=self._lagrange.lagrangian_multiplier
                             )
                         else:
                             loss_return = loss.loss(
@@ -1230,7 +1187,6 @@ class OnPolicyRLEngine(object):
                                 batch=batch,
                                 actor_critic_output=actor_critic_output_for_batch,
                                 lagrangian_multiplier=self._lagrange.lagrangian_multiplier if self.use_constraints else torch.tensor(0.0),
-                                advantage_method = self.advantage_method
                             )
 
                         per_epoch_info = {}
@@ -1480,8 +1436,6 @@ class OnPolicyTrainer(OnPolicyRLEngine):
         })
         
         self.use_constraints = kwargs["use_constraints"]
-        self.advantage_method = kwargs["advantage_method"]  # 'scalarize_advantages' or 'scalarize_rewards'
-        assert self.advantage_method in ['scalarize_advantages', 'scalarize_rewards']
 
         # state level constraints: corner, danger
         # trajectory-level constraints: blind, fragile, critical
@@ -1633,10 +1587,6 @@ class OnPolicyTrainer(OnPolicyRLEngine):
                     save_dict["lagrange_lambda_optimizer_state_dict"] = (
                         self._lagrange.lambda_optimizer.state_dict()
                     )
-                # task_sampler_state = self._task_sampler_state()
-                # if task_sampler_state is not None:
-                #     save_dict["task_sampler_state"] = task_sampler_state
-
                 torch.save(save_dict, model_path)
         return model_path
 
@@ -1706,16 +1656,15 @@ class OnPolicyTrainer(OnPolicyRLEngine):
             save_dict["lagrange_lambda_optimizer_state_dict"] = (
                 self._lagrange.lambda_optimizer.state_dict()
             )
-        # task_sampler_state = self._task_sampler_state()
-        # if task_sampler_state is not None:
-        #     save_dict["task_sampler_state"] = task_sampler_state
-
         torch.save(save_dict, model_path)
 
         return model_path
 
     def checkpoint_load(
-        self, ckpt: Union[str, Dict[str, Any]], restart_pipeline: bool = False
+        self,
+        ckpt: Union[str, Dict[str, Any]],
+        restart_pipeline: bool = False,
+        reset_optimizer: bool = False,
     ) -> Dict[str, Union[Dict[str, Any], torch.Tensor, float, int, str, List]]:
         if restart_pipeline:
             if "training_pipeline_state_dict" in ckpt:
@@ -1759,30 +1708,32 @@ class OnPolicyTrainer(OnPolicyRLEngine):
             self.training_pipeline.restart_pipeline()
         else:
             self.seed = cast(int, ckpt["trainer_seed"])
-            self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])  # type: ignore
-            if self.lr_scheduler is not None and "scheduler_state" in ckpt:
-                self.lr_scheduler.load_state_dict(ckpt["scheduler_state"])  # type: ignore
-            if (
-                "multipliers_optim_state_dict" in ckpt
-                and hasattr(self, "multipliers_optim")
-            ):
-                self.multipliers_optim.load_state_dict(
-                    cast(Dict[str, Any], ckpt["multipliers_optim_state_dict"])
-                )
-            if (
-                "lagrange_lambda_optimizer_state_dict" in ckpt
-                and hasattr(self, "_lagrange")
-                and self._lagrange is not None
-            ):
-                self._lagrange.lambda_optimizer.load_state_dict(
-                    cast(Dict[str, Any], ckpt["lagrange_lambda_optimizer_state_dict"])
+            if not reset_optimizer:
+                if "optimizer_state_dict" in ckpt:
+                    self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])  # type: ignore
+                if self.lr_scheduler is not None and "scheduler_state" in ckpt:
+                    self.lr_scheduler.load_state_dict(ckpt["scheduler_state"])  # type: ignore
+                if (
+                    "multipliers_optim_state_dict" in ckpt
+                    and hasattr(self, "multipliers_optim")
+                ):
+                    self.multipliers_optim.load_state_dict(
+                        cast(Dict[str, Any], ckpt["multipliers_optim_state_dict"])
+                    )
+                if (
+                    "lagrange_lambda_optimizer_state_dict" in ckpt
+                    and hasattr(self, "_lagrange")
+                    and self._lagrange is not None
+                ):
+                    self._lagrange.lambda_optimizer.load_state_dict(
+                        cast(Dict[str, Any], ckpt["lagrange_lambda_optimizer_state_dict"])
+                    )
+            else:
+                get_logger().info(
+                    f"[{self.mode} worker {self.worker_id}] reset_optimizer=True: skipping optimizer state restore."
                 )
 
         self.deterministic_seeds()
-        # if not restart_pipeline and "task_sampler_state" in ckpt:
-        #     self._load_task_sampler_state(
-        #         cast(List[Dict[str, Any]], ckpt["task_sampler_state"])
-        #     )
 
         return ckpt
 
@@ -1932,6 +1883,7 @@ class OnPolicyTrainer(OnPolicyRLEngine):
             model_path = self.checkpoint_save(pipeline_stage_index=pipeline_stage_index)
             if self.checkpoints_queue is not None:
                 self.checkpoints_queue.put(("eval", model_path))
+
         self.last_save = self.training_pipeline.total_steps
         return model_path
 
@@ -2272,30 +2224,36 @@ class OnPolicyTrainer(OnPolicyRLEngine):
                 )
                 self.tracking_info_list.clear()
                 self.last_log = self.training_pipeline.total_steps
-
-            if (
-                cur_stage_training_settings.advance_scene_rollout_period is not None
-            ) and (
-                self.training_pipeline.rollout_count
-                % cur_stage_training_settings.advance_scene_rollout_period
-                == 0
-            ):
-                get_logger().info(
-                    f"[{self.mode} worker {self.worker_id}] Force advance"
-                    f" tasks with {self.training_pipeline.rollout_count} rollouts"
+                
+            if cur_stage_training_settings.advance_scene_rollout_period is not None:
+                force_advance = (
+                    self.training_pipeline.rollout_count
+                    % cur_stage_training_settings.advance_scene_rollout_period
+                    == 0
                 )
-                self.vector_tasks.next_task(force_advance_scene=True)
-                self.initialize_storage_and_viz(
-                    storage_to_initialize=cast(
-                        List[ExperienceStorage], list(uuid_to_storage.values())
+                if force_advance:
+                    get_logger().info(
+                        f"[{self.mode} worker {self.worker_id}] Force advance"
+                        f" tasks with {self.training_pipeline.rollout_count} rollouts"
                     )
-                )
+                self.vector_tasks.next_task(force_advance_scene=force_advance)
+                # For GRPO, episodes do not continue across rollouts (auto_resample_when_done=False),
+                # so we must always reinitialize storage with a fresh observation after every rollout.
+                # For PPO, only reinitialize when force-advancing to a new scene.
+                if self._use_grpo or force_advance:
+                    self.initialize_storage_and_viz(
+                        storage_to_initialize=cast(
+                            List[ExperienceStorage], list(uuid_to_storage.values())
+                        )
+                    )
 
     def train(
         self,
         checkpoint_file_name: Optional[str] = None,
         restart_pipeline: bool = False,
         valid_on_initial_weights: bool = False,
+        reset_optimizer: bool = False,
+        lr_warmup_steps: int = 0,
     ):
         assert (
             self.mode == TRAIN_MODE_STR
@@ -2305,7 +2263,22 @@ class OnPolicyTrainer(OnPolicyRLEngine):
         # noinspection PyBroadException
         try:
             if checkpoint_file_name is not None:
-                self.checkpoint_load(checkpoint_file_name, restart_pipeline)
+                self.checkpoint_load(
+                    checkpoint_file_name,
+                    restart_pipeline,
+                    reset_optimizer=reset_optimizer,
+                )
+
+            if lr_warmup_steps > 0:
+                self.lr_scheduler = torch.optim.lr_scheduler.LinearLR(
+                    self.optimizer,
+                    start_factor=1e-8,
+                    end_factor=1.0,
+                    total_iters=lr_warmup_steps,
+                )
+                get_logger().info(
+                    f"[{self.mode} worker {self.worker_id}] LR warmup over {lr_warmup_steps} steps."
+                )
 
             self.run_pipeline(valid_on_initial_weights=valid_on_initial_weights)
 

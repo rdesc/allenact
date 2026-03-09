@@ -406,6 +406,8 @@ class OnPolicyRunner(object):
         checkpoint: Optional[str] = None,
         restart_pipeline: bool = False,
         valid_on_initial_weights: bool = False,
+        reset_optimizer: bool = False,
+        lr_warmup_steps: int = 0,
         *engine_args,
         **engine_kwargs,
     ):
@@ -426,6 +428,8 @@ class OnPolicyRunner(object):
                 checkpoint_file_name=checkpoint,
                 restart_pipeline=restart_pipeline,
                 valid_on_initial_weights=valid_on_initial_weights,
+                reset_optimizer=reset_optimizer,
+                lr_warmup_steps=lr_warmup_steps,
             )
 
     @staticmethod
@@ -507,6 +511,8 @@ class OnPolicyRunner(object):
         use_constraints: Optional[bool] = None,
         constraint_thresholds: Optional[Sequence[float]] = None,
         constraint_names: Optional[Sequence[str]] = None,
+        reset_optimizer: bool = False,
+        lr_warmup_steps: int = 0,
     ):
         assert cost_limit is not None, "cost_limit must be set"
         self._initialize_start_train_or_start_test()
@@ -590,6 +596,10 @@ class OnPolicyRunner(object):
                 training_kwargs["constraint_thresholds"] = list(constraint_thresholds)
             if constraint_names is not None:
                 training_kwargs["constraint_names"] = list(constraint_names)
+            if reset_optimizer:
+                training_kwargs["reset_optimizer"] = True
+            if lr_warmup_steps > 0:
+                training_kwargs["lr_warmup_steps"] = lr_warmup_steps
             train: BaseProcess = self.mp_ctx.Process(
                 target=self.train_loop,
                 kwargs=training_kwargs,
