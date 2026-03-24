@@ -808,7 +808,7 @@ class RolloutBlockStorage(RolloutStorage, MiniBatchStorageMixin):
                 return_batch.append(self.returns[:-1, ind])
                 c_return_batch.append(self.c_returns[:-1, ind])
                 rewards_batch.append(self.rewards[:, ind])
-                masks_batch.append(self.masks[:-1, ind])
+                masks_batch.append(self.masks[:-1, ind])  # TODO: this why is 0 at index 0 ?
                 old_action_log_probs_batch.append(self.action_log_probs[:, ind])
 
                 adv_targ.append(self._advantages[:, ind])

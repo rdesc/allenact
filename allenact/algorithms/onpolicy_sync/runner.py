@@ -513,6 +513,7 @@ class OnPolicyRunner(object):
         constraint_names: Optional[Sequence[str]] = None,
         reset_optimizer: bool = False,
         lr_warmup_steps: int = 0,
+        grad_accum_steps: int = 1,
     ):
         assert cost_limit is not None, "cost_limit must be set"
         self._initialize_start_train_or_start_test()
@@ -600,6 +601,8 @@ class OnPolicyRunner(object):
                 training_kwargs["reset_optimizer"] = True
             if lr_warmup_steps > 0:
                 training_kwargs["lr_warmup_steps"] = lr_warmup_steps
+            if grad_accum_steps > 1:
+                training_kwargs["grad_accum_steps"] = grad_accum_steps
             train: BaseProcess = self.mp_ctx.Process(
                 target=self.train_loop,
                 kwargs=training_kwargs,

@@ -951,54 +951,53 @@ class OnPolicyRLEngine(object):
         
         storage_obj = self.training_pipeline.current_stage_storage[self.training_pipeline.rollout_storage_uuid]
         
-        tracking_info_partial = partial(
-            TrackingInfo,
-            type=TrackingInfoType.UPDATE_INFO,
-            n=1,
-            storage_uuid=stage_component.storage_uuid,
-            stage_component_uuid=stage_component.uuid,
-        )
-        
-        enforced_constraint_rates = []  # local to this worker
-        enforced_constraint_rates_agg = []  # aggregated across workers
-        
-        masks = storage_obj.masks.clone()[1:]  # [num_steps, num_samplers, 1]
-        trajectory_lengths = masks.sum(dim=0)  # [num_samplers, 1]
-        
-        group_size = self._grpo_num_generations if self._use_grpo else len(trajectory_lengths)
-        
-        for name in self.constraint_names:
-            sub_cost = getattr(storage_obj, name) * masks # [num_steps, num_samplers, 1]
-            
-            sub_cost_mean = (
-                sub_cost.view(sub_cost.shape[0], -1, group_size).sum((0,2)) /
-                trajectory_lengths.view(-1, group_size).sum(1)  # (num_samplers // group_size, )
-            )
-            assert sub_cost_mean.shape[0] == trajectory_lengths.shape[0] // group_size
-
-            sub_cost_mean_agg = self.distributed_weighted_sum(
-                sub_cost.sum() / trajectory_lengths.sum(), 1 / self.num_workers
-                )
-
-            enforced_constraint_rates.append(sub_cost_mean)
-            enforced_constraint_rates_agg.append(sub_cost_mean_agg)
-
-            self.tracking_info_list.append(
-                tracking_info_partial(info={f"constraints/{name}": sub_cost_mean_agg},)
-            )
-            
-        enforced_constraint_rates = torch.stack(enforced_constraint_rates, dim=1)  # [num_samplers // group_size, num_constraints]
-        enforced_constraint_rates_agg = torch.tensor(enforced_constraint_rates_agg, dtype=torch.float32, device=self.device)
-        
-        # only do the update if we are using constraints
         if self.use_constraints:
+            tracking_info_partial = partial(
+                TrackingInfo,
+                type=TrackingInfoType.UPDATE_INFO,
+                n=1,
+                storage_uuid=stage_component.storage_uuid,
+                stage_component_uuid=stage_component.uuid,
+            )
+            
             multipliers = torch.nn.functional.softmax(self.multiplier_params, dim=0)[1:]
+            
+            enforced_constraint_rates = []  # local to this worker
+            enforced_constraint_rates_agg = []  # aggregated across workers
+            
+            masks = storage_obj.masks.clone()[1:]  # [num_steps, num_samplers, 1]  # TODO: confirm what mask = 0 means in the original code
+            trajectory_lengths = masks.sum(dim=0)  # [num_samplers, 1]
+            
+            group_size = self._grpo_num_generations if self._use_grpo else len(trajectory_lengths)
+            
+            for name in self.constraint_names:
+                sub_cost = getattr(storage_obj, name) * masks # [num_steps, num_samplers, 1]
+                
+                sub_cost_mean = (
+                    sub_cost.view(sub_cost.shape[0], -1, group_size).sum((0,2)) /
+                    trajectory_lengths.view(-1, group_size).sum(1)  # (num_samplers // group_size, )
+                )
+                assert sub_cost_mean.shape[0] == trajectory_lengths.shape[0] // group_size
+
+                sub_cost_mean_agg = self.distributed_weighted_sum(
+                    sub_cost.sum() / trajectory_lengths.sum(), 1 / self.num_workers
+                    )
+
+                enforced_constraint_rates.append(sub_cost_mean)
+                enforced_constraint_rates_agg.append(sub_cost_mean_agg)
+
+                self.tracking_info_list.append(
+                    tracking_info_partial(info={f"constraints/{name}": sub_cost_mean_agg},)
+                )
+                
+            enforced_constraint_rates_agg = torch.tensor(enforced_constraint_rates_agg, dtype=torch.float32, device=self.device)
+            
             multiplier_losses = self.multiplier_signs * multipliers * (enforced_constraint_rates_agg - self.constraint_thresholds)
             multiplier_loss = torch.sum(multiplier_losses, dim=0)
             self.multipliers_optim.zero_grad()
             multiplier_loss.backward()
             self.multipliers_optim.step()
-
+            
             cost_weights = self.multiplier_signs * multipliers.detach()
             reward_weight = 1. - torch.sum(torch.abs(cost_weights), axis=0)
             
@@ -1020,18 +1019,18 @@ class OnPolicyRLEngine(object):
                     tracking_info_partial(
                         info={f"raw_multipliers_values/{constraint_name}": self.multiplier_params[k+1].item()},)
                 )
-
+        
         costs = self.training_pipeline.current_stage_storage[self.training_pipeline.rollout_storage_uuid].costs * masks
         costs_mean = self.distributed_weighted_sum(costs.sum() / costs.shape[1], 1 / self.num_workers)  # this is averaging the costs.sum() across workers
-
-        # commented out in original SafeVLA code
+        
+        # commented out in SafeVLA code
         # self._lagrange.update_lagrange_multiplier(self.distributed_weighted_sum(self.training_pipeline.current_stage_storage[self.training_pipeline.rollout_storage_uuid].costs.mean(), 1/self.num_workers))
 
         # original SafeVLA code
         # costs = self.training_pipeline.current_stage_storage[self.training_pipeline.rollout_storage_uuid].costs
         # costs_summed_over_steps = costs.sum(dim=0)
         # costs_mean = costs_summed_over_steps.mean()
-
+        
         self._lagrange.update_lagrange_multiplier(costs_mean)
         
         training_settings = stage_component.training_settings
@@ -1175,11 +1174,10 @@ class OnPolicyRLEngine(object):
                                 step_count=self.step_count,
                                 batch=batch,
                                 actor_critic_output=actor_critic_output_for_batch,
-                                constraint_weights=cost_weights,  # lagrange multipliers
-                                constraint_names=self.constraint_names,
-                                costs=enforced_constraint_rates,  # constraint satisfaction rates
-                                reward_weight=reward_weight.item(),
-                                lagrangian_multiplier=self._lagrange.lagrangian_multiplier
+                                constraint_weights=cost_weights.tolist(),
+                                costs={name: getattr(storage_obj, name) for name in self.constraint_names},  # the satisfaction rate here right?
+                                reward_weight = reward_weight.item(),
+                                advantage_method = self.advantage_method
                             )
                         else:
                             loss_return = loss.loss(
@@ -1187,6 +1185,7 @@ class OnPolicyRLEngine(object):
                                 batch=batch,
                                 actor_critic_output=actor_critic_output_for_batch,
                                 lagrangian_multiplier=self._lagrange.lagrangian_multiplier if self.use_constraints else torch.tensor(0.0),
+                                advantage_method = self.advantage_method
                             )
 
                         per_epoch_info = {}
@@ -1436,7 +1435,9 @@ class OnPolicyTrainer(OnPolicyRLEngine):
         })
         
         self.use_constraints = kwargs["use_constraints"]
-
+        self.advantage_method = kwargs["advantage_method"]  # 'scalarize_advantages' or 'scalarize_rewards'
+        assert self.advantage_method in ['scalarize_advantages', 'scalarize_rewards']
+        
         # state level constraints: corner, danger
         # trajectory-level constraints: blind, fragile, critical
         self.constraint_names = ["corner", "danger", "blind", "fragile", "critical"]
@@ -1587,6 +1588,10 @@ class OnPolicyTrainer(OnPolicyRLEngine):
                     save_dict["lagrange_lambda_optimizer_state_dict"] = (
                         self._lagrange.lambda_optimizer.state_dict()
                     )
+                # task_sampler_state = self._task_sampler_state()
+                # if task_sampler_state is not None:
+                #     save_dict["task_sampler_state"] = task_sampler_state
+
                 torch.save(save_dict, model_path)
         return model_path
 
@@ -1661,10 +1666,7 @@ class OnPolicyTrainer(OnPolicyRLEngine):
         return model_path
 
     def checkpoint_load(
-        self,
-        ckpt: Union[str, Dict[str, Any]],
-        restart_pipeline: bool = False,
-        reset_optimizer: bool = False,
+        self, ckpt: Union[str, Dict[str, Any]], restart_pipeline: bool = False
     ) -> Dict[str, Union[Dict[str, Any], torch.Tensor, float, int, str, List]]:
         if restart_pipeline:
             if "training_pipeline_state_dict" in ckpt:
@@ -1708,29 +1710,23 @@ class OnPolicyTrainer(OnPolicyRLEngine):
             self.training_pipeline.restart_pipeline()
         else:
             self.seed = cast(int, ckpt["trainer_seed"])
-            if not reset_optimizer:
-                if "optimizer_state_dict" in ckpt:
-                    self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])  # type: ignore
-                if self.lr_scheduler is not None and "scheduler_state" in ckpt:
-                    self.lr_scheduler.load_state_dict(ckpt["scheduler_state"])  # type: ignore
-                if (
-                    "multipliers_optim_state_dict" in ckpt
-                    and hasattr(self, "multipliers_optim")
-                ):
-                    self.multipliers_optim.load_state_dict(
-                        cast(Dict[str, Any], ckpt["multipliers_optim_state_dict"])
-                    )
-                if (
-                    "lagrange_lambda_optimizer_state_dict" in ckpt
-                    and hasattr(self, "_lagrange")
-                    and self._lagrange is not None
-                ):
-                    self._lagrange.lambda_optimizer.load_state_dict(
-                        cast(Dict[str, Any], ckpt["lagrange_lambda_optimizer_state_dict"])
-                    )
-            else:
-                get_logger().info(
-                    f"[{self.mode} worker {self.worker_id}] reset_optimizer=True: skipping optimizer state restore."
+            self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])  # type: ignore
+            if self.lr_scheduler is not None and "scheduler_state" in ckpt:
+                self.lr_scheduler.load_state_dict(ckpt["scheduler_state"])  # type: ignore
+            if (
+                "multipliers_optim_state_dict" in ckpt
+                and hasattr(self, "multipliers_optim")
+            ):
+                self.multipliers_optim.load_state_dict(
+                    cast(Dict[str, Any], ckpt["multipliers_optim_state_dict"])
+                )
+            if (
+                "lagrange_lambda_optimizer_state_dict" in ckpt
+                and hasattr(self, "_lagrange")
+                and self._lagrange is not None
+            ):
+                self._lagrange.lambda_optimizer.load_state_dict(
+                    cast(Dict[str, Any], ckpt["lagrange_lambda_optimizer_state_dict"])
                 )
 
         self.deterministic_seeds()
@@ -1883,7 +1879,6 @@ class OnPolicyTrainer(OnPolicyRLEngine):
             model_path = self.checkpoint_save(pipeline_stage_index=pipeline_stage_index)
             if self.checkpoints_queue is not None:
                 self.checkpoints_queue.put(("eval", model_path))
-
         self.last_save = self.training_pipeline.total_steps
         return model_path
 
@@ -2224,36 +2219,30 @@ class OnPolicyTrainer(OnPolicyRLEngine):
                 )
                 self.tracking_info_list.clear()
                 self.last_log = self.training_pipeline.total_steps
-                
-            if cur_stage_training_settings.advance_scene_rollout_period is not None:
-                force_advance = (
-                    self.training_pipeline.rollout_count
-                    % cur_stage_training_settings.advance_scene_rollout_period
-                    == 0
+
+            if (
+                cur_stage_training_settings.advance_scene_rollout_period is not None
+            ) and (
+                self.training_pipeline.rollout_count
+                % cur_stage_training_settings.advance_scene_rollout_period
+                == 0
+            ):
+                get_logger().info(
+                    f"[{self.mode} worker {self.worker_id}] Force advance"
+                    f" tasks with {self.training_pipeline.rollout_count} rollouts"
                 )
-                if force_advance:
-                    get_logger().info(
-                        f"[{self.mode} worker {self.worker_id}] Force advance"
-                        f" tasks with {self.training_pipeline.rollout_count} rollouts"
+                self.vector_tasks.next_task(force_advance_scene=True)
+                self.initialize_storage_and_viz(
+                    storage_to_initialize=cast(
+                        List[ExperienceStorage], list(uuid_to_storage.values())
                     )
-                self.vector_tasks.next_task(force_advance_scene=force_advance)
-                # For GRPO, episodes do not continue across rollouts (auto_resample_when_done=False),
-                # so we must always reinitialize storage with a fresh observation after every rollout.
-                # For PPO, only reinitialize when force-advancing to a new scene.
-                if self._use_grpo or force_advance:
-                    self.initialize_storage_and_viz(
-                        storage_to_initialize=cast(
-                            List[ExperienceStorage], list(uuid_to_storage.values())
-                        )
-                    )
+                )
 
     def train(
         self,
         checkpoint_file_name: Optional[str] = None,
         restart_pipeline: bool = False,
         valid_on_initial_weights: bool = False,
-        reset_optimizer: bool = False,
-        lr_warmup_steps: int = 0,
     ):
         assert (
             self.mode == TRAIN_MODE_STR
